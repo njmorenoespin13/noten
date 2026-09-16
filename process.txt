@@ -1,0 +1,1170 @@
+import argparse
+import asyncio
+import inspect
+import signal
+import sys
+import threading
+import time
+
+from concurrent import futures
+from dataclasses import dataclass, field
+
+import grpc
+
+
+import audio_listener_pb2
+import audio_listener_pb2_grpc
+
+
+# ============================================================
+# IMPORTAR TU CLASE
+# ============================================================
+#
+# AJUSTA SOLAMENTE ESTA IMPORTACIÓN al nombre real del archivo.
+#
+# Si tienes:
+#
+#     worker_process.py
+#
+# entonces:
+#
+#     from worker_process import workerProcess
+#
+# ============================================================
+
+from worker_process import workerProcess
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 9000
+
+# ------------------------------------------------------------
+# Tiempo de inactividad.
+#
+# 10 minutos = 600 segundos
+# ------------------------------------------------------------
+
+DEFAULT_CALL_TIMEOUT = 10 * 60
+
+# ------------------------------------------------------------
+# Cada cuánto revisamos sesiones inactivas.
+# ------------------------------------------------------------
+
+CLEANUP_INTERVAL = 30
+
+
+# ============================================================
+# ESTADO DE UNA LLAMADA
+# ============================================================
+
+@dataclass
+class CallSession:
+
+    # --------------------------------------------------------
+    # Identificador
+    # --------------------------------------------------------
+
+    call_id: str
+
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
+
+    metadata_json: str = ""
+
+    # --------------------------------------------------------
+    # Instancia EXCLUSIVA de workerProcess
+    # --------------------------------------------------------
+
+    processor: object | None = None
+
+    # --------------------------------------------------------
+    # Estado del processListen
+    # --------------------------------------------------------
+
+    processing: bool = False
+
+    # --------------------------------------------------------
+    # Si se solicitó eliminar la sesión.
+    # --------------------------------------------------------
+
+    cleanup_requested: bool = False
+
+    # --------------------------------------------------------
+    # Última actividad recibida.
+    # --------------------------------------------------------
+
+    last_activity: float = field(
+        default_factory=time.monotonic
+    )
+
+    # --------------------------------------------------------
+    # Lock de ESTA sesión.
+    #
+    # Nunca se utiliza mientras processListen está ejecutándose.
+    # --------------------------------------------------------
+
+    lock: threading.Lock = field(
+        default_factory=threading.Lock
+    )
+
+    # --------------------------------------------------------
+    # Thread donde se ejecuta processListen.
+    # --------------------------------------------------------
+
+    worker_thread: threading.Thread | None = None
+
+    # --------------------------------------------------------
+    # Cantidad de solicitudes recibidas.
+    # --------------------------------------------------------
+
+    requests_received: int = 0
+
+    # --------------------------------------------------------
+    # Cantidad ignorada mientras estaba procesando.
+    # --------------------------------------------------------
+
+    requests_ignored: int = 0
+
+    # --------------------------------------------------------
+    # Indica que la sesión está cerrándose.
+    # --------------------------------------------------------
+
+    closing: bool = False
+
+
+# ============================================================
+# AUDIO OUT SERVICE
+# ============================================================
+
+class AudioOutService(
+    audio_listener_pb2_grpc.SegmentOutputServicer
+):
+
+    def __init__(
+        self,
+        block_active: bool = False,
+        call_timeout: int = DEFAULT_CALL_TIMEOUT,
+    ):
+
+        # ====================================================
+        # CONFIGURACIÓN
+        # ====================================================
+
+        self.block_active = block_active
+
+        self.call_timeout = call_timeout
+
+        # ====================================================
+        # SESIONES
+        # ====================================================
+        #
+        # Cada call_id tiene su propio objeto.
+        #
+        # ====================================================
+
+        self.sessions: dict[str, CallSession] = {}
+
+        self.sessions_lock = threading.Lock()
+
+        # ====================================================
+        # CONTROL
+        # ====================================================
+
+        self.running = True
+
+        # ====================================================
+        # THREAD DE CLEANUP
+        # ====================================================
+
+        self.cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="audio-out-cleanup",
+            daemon=True,
+        )
+
+        self.cleanup_thread.start()
+
+        print(
+            "[OUT] AudioOutService iniciado"
+        )
+
+        print(
+            f"[OUT] block_active = "
+            f"{self.block_active}"
+        )
+
+        print(
+            f"[OUT] call_timeout = "
+            f"{self.call_timeout}s"
+        )
+
+
+    # ========================================================
+    # PING
+    # ========================================================
+
+    def Ping(
+        self,
+        request,
+        context,
+    ):
+
+        print(
+            f"[OUT] Ping received | "
+            f"source={request.source}"
+        )
+
+        return audio_listener_pb2.PingResponse(
+            success=True,
+            service="audio-out",
+            message="OUT is alive",
+        )
+
+
+    # ========================================================
+    # SEND SEGMENT
+    # ========================================================
+
+    def SendSegment(
+        self,
+        request,
+        context,
+    ):
+
+        call_id = request.call_id
+
+        # ----------------------------------------------------
+        # Validar call_id
+        # ----------------------------------------------------
+
+        if not call_id:
+
+            print(
+                "[OUT] ERROR | call_id vacío",
+                file=sys.stderr,
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        # ----------------------------------------------------
+        # Obtener / crear sesión
+        # ----------------------------------------------------
+
+        session = self._get_or_create_session(
+            call_id,
+            request.metadata_json,
+        )
+
+        # ----------------------------------------------------
+        # Actualizar actividad
+        # ----------------------------------------------------
+
+        with session.lock:
+
+            # ----------------------------------------------
+            # Si la sesión ya está cerrándose
+            # ----------------------------------------------
+
+            if session.closing:
+
+                print(
+                    f"[OUT] Request ignorada | "
+                    f"call={call_id} | "
+                    f"sesión cerrándose"
+                )
+
+                return audio_listener_pb2.SegmentResponse(
+                    success=False
+                )
+
+            session.last_activity = (
+                time.monotonic()
+            )
+
+            session.requests_received += 1
+
+            # ----------------------------------------------
+            # Metadata
+            # ----------------------------------------------
+
+            if request.metadata_json:
+
+                session.metadata_json = (
+                    request.metadata_json
+                )
+
+            # ----------------------------------------------
+            # BLOCK ACTIVE
+            # ----------------------------------------------
+            #
+            # Si processListen está ejecutándose:
+            #
+            # ignoramos la solicitud.
+            #
+            # ----------------------------------------------
+
+            if (
+                self.block_active
+                and
+                session.processing
+            ):
+
+                session.requests_ignored += 1
+
+                print(
+                    f"[OUT] Request IGNORADA | "
+                    f"call={call_id} | "
+                    f"segment={request.segment_id} | "
+                    f"processListen activo"
+                )
+
+                # ------------------------------------------
+                # Respondemos inmediatamente.
+                #
+                # No esperamos.
+                # No bloqueamos.
+                # ------------------------------------------
+
+                return audio_listener_pb2.SegmentResponse(
+                    success=True
+                )
+
+        # ====================================================
+        # SI LLEGAMOS AQUÍ:
+        #
+        # La solicitud puede procesarse.
+        # ====================================================
+
+        print(
+            f"[OUT] Request recibida | "
+            f"call={call_id} | "
+            f"segment={request.segment_id}"
+        )
+
+        # ----------------------------------------------------
+        # Si processListen ya terminó y queremos activar
+        # nuevamente el proceso, hacemos un nuevo worker.
+        # ----------------------------------------------------
+
+        self._start_process_if_needed(
+            session
+        )
+
+        return audio_listener_pb2.SegmentResponse(
+            success=True
+        )
+
+
+    # ========================================================
+    # CREAR / OBTENER SESIÓN
+    # ========================================================
+
+    def _get_or_create_session(
+        self,
+        call_id: str,
+        metadata_json: str,
+    ):
+
+        with self.sessions_lock:
+
+            session = self.sessions.get(
+                call_id
+            )
+
+            # ------------------------------------------------
+            # Ya existe
+            # ------------------------------------------------
+
+            if session is not None:
+
+                return session
+
+            # ------------------------------------------------
+            # Nueva sesión
+            # ------------------------------------------------
+
+            print(
+                "[OUT] ========================================"
+            )
+
+            print(
+                f"[OUT] NUEVO CALL_ID: {call_id}"
+            )
+
+            print(
+                "[OUT] Creando workerProcess independiente"
+            )
+
+            print(
+                "[OUT] ========================================"
+            )
+
+            # =================================================
+            # CREAR INSTANCIA INDEPENDIENTE
+            # =================================================
+
+            try:
+
+                processor = workerProcess()
+
+            except Exception as exc:
+
+                print(
+                    f"[OUT] ERROR creando workerProcess | "
+                    f"call={call_id} | "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+
+                raise
+
+            # =================================================
+            # CREAR SESIÓN
+            # =================================================
+
+            session = CallSession(
+                call_id=call_id,
+                metadata_json=metadata_json,
+                processor=processor,
+            )
+
+            # ------------------------------------------------
+            # Guardar
+            # ------------------------------------------------
+
+            self.sessions[call_id] = session
+
+            print(
+                f"[OUT] workerProcess creado | "
+                f"call={call_id}"
+            )
+
+            return session
+
+
+    # ========================================================
+    # ACTIVAR processListen
+    # ========================================================
+
+    def _start_process_if_needed(
+        self,
+        session: CallSession,
+    ):
+
+        # ====================================================
+        # Comprobar estado
+        # ====================================================
+
+        with session.lock:
+
+            # ------------------------------------------------
+            # Ya está procesando.
+            # ------------------------------------------------
+
+            if session.processing:
+
+                return
+
+            # ------------------------------------------------
+            # Está cerrándose.
+            # ------------------------------------------------
+
+            if session.closing:
+
+                return
+
+            # ------------------------------------------------
+            # Marcar procesamiento activo ANTES de arrancar
+            # el thread.
+            # ------------------------------------------------
+
+            session.processing = True
+
+            # ------------------------------------------------
+            # Crear thread exclusivo
+            # ------------------------------------------------
+
+            thread = threading.Thread(
+                target=self._call_worker,
+                args=(session,),
+                name=f"process-{session.call_id}",
+                daemon=True,
+            )
+
+            session.worker_thread = thread
+
+        # ====================================================
+        # IMPORTANTE:
+        #
+        # arrancamos FUERA del lock.
+        # ====================================================
+
+        thread.start()
+
+        print(
+            f"[OUT] processListen iniciado | "
+            f"call={session.call_id}"
+        )
+
+
+    # ========================================================
+    # WORKER DEL CALL_ID
+    # ========================================================
+
+    def _call_worker(
+        self,
+        session: CallSession,
+    ):
+
+        call_id = session.call_id
+
+        print(
+            f"[OUT] ========================================"
+        )
+
+        print(
+            f"[OUT] PROCESS START | call={call_id}"
+        )
+
+        print(
+            f"[OUT] ========================================"
+        )
+
+        try:
+
+            # =================================================
+            # OBTENER DATOS
+            # =================================================
+
+            with session.lock:
+
+                metadata = (
+                    session.metadata_json
+                )
+
+                processor = (
+                    session.processor
+                )
+
+            # =================================================
+            # =================================================
+            #
+            #        AQUÍ SE EJECUTA TU PROCESO
+            #
+            # =================================================
+            # =================================================
+            #
+            # TU FUNCIÓN ES:
+            #
+            #     workerProcess.processListen(
+            #         call_id,
+            #         metadata,
+            #         ...
+            #     )
+            #
+            # =================================================
+
+            result = processor.processListen(
+                call_id,
+                metadata,
+                # =============================================
+                # AGREGA AQUÍ LOS DEMÁS ARGUMENTOS
+                # =============================================
+            )
+
+            # =================================================
+            # SI processListen ES ASYNC
+            # =================================================
+
+            if inspect.isawaitable(result):
+
+                print(
+                    f"[OUT] processListen detectado "
+                    f"como async | call={call_id}"
+                )
+
+                asyncio.run(
+                    result
+                )
+
+            # =================================================
+            # SI ES NORMAL / SINCRÓNICO
+            # =================================================
+            #
+            # Ya fue ejecutado arriba.
+            #
+            # =================================================
+
+        except Exception as exc:
+
+            # =================================================
+            # ERROR TOTALMENTE AISLADO
+            # =================================================
+            #
+            # Este error solamente afecta este call_id.
+            #
+            # =================================================
+
+            print(
+                f"[OUT] ERROR processListen | "
+                f"call={call_id} | "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+        finally:
+
+            # =================================================
+            # MARCAR FINALIZADO
+            # =================================================
+
+            cleanup_after = False
+
+            with session.lock:
+
+                session.processing = False
+
+                cleanup_after = (
+                    session.cleanup_requested
+                )
+
+            print(
+                f"[OUT] ========================================"
+            )
+
+            print(
+                f"[OUT] processListen FINALIZADO | "
+                f"call={call_id}"
+            )
+
+            print(
+                f"[OUT] ========================================"
+            )
+
+            # =================================================
+            # SI DURANTE EL PROCESAMIENTO SE MARCÓ PARA
+            # LIMPIEZA, AHORA SÍ LO ELIMINAMOS.
+            # =================================================
+
+            if cleanup_after:
+
+                self._remove_session(
+                    call_id,
+                    reason=(
+                        "timeout durante processListen"
+                    ),
+                )
+
+
+    # ========================================================
+    # CLEANUP LOOP
+    # ========================================================
+
+    def _cleanup_loop(self):
+
+        print(
+            "[OUT] Cleanup monitor iniciado"
+        )
+
+        while self.running:
+
+            try:
+
+                time.sleep(
+                    CLEANUP_INTERVAL
+                )
+
+                now = time.monotonic()
+
+                expired = []
+
+                # ============================================
+                # BUSCAR SESIONES INACTIVAS
+                # ============================================
+
+                with self.sessions_lock:
+
+                    for call_id, session in (
+                        self.sessions.items()
+                    ):
+
+                        with session.lock:
+
+                            inactive = (
+                                now -
+                                session.last_activity
+                            )
+
+                            # --------------------------------
+                            # Más de 10 minutos
+                            # --------------------------------
+
+                            if (
+                                inactive
+                                >=
+                                self.call_timeout
+                            ):
+
+                                # --------------------------------
+                                # Si está procesando:
+                                #
+                                # NO lo destruimos todavía.
+                                #
+                                # --------------------------------
+
+                                if session.processing:
+
+                                    if not session.cleanup_requested:
+
+                                        session.cleanup_requested = True
+
+                                        print(
+                                            f"[OUT] Timeout detectado "
+                                            f"pero processListen sigue "
+                                            f"activo | "
+                                            f"call={call_id}"
+                                        )
+
+                                else:
+
+                                    expired.append(
+                                        call_id
+                                    )
+
+                # ============================================
+                # LIMPIAR
+                # ============================================
+
+                for call_id in expired:
+
+                    self._remove_session(
+                        call_id,
+                        reason=(
+                            "10 minutos sin actividad"
+                        ),
+                    )
+
+            except Exception as exc:
+
+                print(
+                    f"[OUT] ERROR cleanup | "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+
+
+    # ========================================================
+    # ELIMINAR SESIÓN
+    # ========================================================
+
+    def _remove_session(
+        self,
+        call_id: str,
+        reason: str,
+    ):
+
+        # ====================================================
+        # SACAR DEL DICCIONARIO
+        # ====================================================
+
+        with self.sessions_lock:
+
+            session = self.sessions.get(
+                call_id
+            )
+
+            if session is None:
+
+                return
+
+            with session.lock:
+
+                if session.closing:
+
+                    return
+
+                # --------------------------------------------
+                # Si todavía procesa, marcar para después.
+                # --------------------------------------------
+
+                if session.processing:
+
+                    session.cleanup_requested = True
+
+                    print(
+                        f"[OUT] Cleanup pospuesto | "
+                        f"call={call_id} | "
+                        f"processListen activo"
+                    )
+
+                    return
+
+                session.closing = True
+
+            # --------------------------------------------
+            # Sacar inmediatamente.
+            # --------------------------------------------
+
+            del self.sessions[
+                call_id
+            ]
+
+        # ====================================================
+        # LIMPIAR
+        # ====================================================
+
+        print(
+            f"[OUT] ========================================"
+        )
+
+        print(
+            f"[OUT] LIMPIANDO CALL_ID | {call_id}"
+        )
+
+        print(
+            f"[OUT] Motivo: {reason}"
+        )
+
+        print(
+            f"[OUT] ========================================"
+        )
+
+        try:
+
+            self._cleanup_processor(
+                session
+            )
+
+        except Exception as exc:
+
+            print(
+                f"[OUT] ERROR cleanup | "
+                f"call={call_id} | "
+                f"{exc}",
+                file=sys.stderr,
+            )
+
+        print(
+            f"[OUT] Sesión eliminada | "
+            f"call={call_id}"
+        )
+
+
+    # ========================================================
+    # LIMPIAR workerProcess
+    # ========================================================
+
+    def _cleanup_processor(
+        self,
+        session: CallSession,
+    ):
+
+        processor = session.processor
+
+        if processor is None:
+
+            return
+
+        print(
+            f"[OUT] Liberando workerProcess | "
+            f"call={session.call_id}"
+        )
+
+        # ====================================================
+        # ====================================================
+        #
+        # SI TU CLASE TIENE UNA FUNCIÓN DE LIMPIEZA:
+        #
+        #     processor.close()
+        #
+        # o:
+        #
+        #     processor.cleanup()
+        #
+        # o:
+        #
+        #     processor.stop()
+        #
+        # PONLA AQUÍ.
+        #
+        # ====================================================
+        # ====================================================
+
+        # EJEMPLO:
+        #
+        # processor.close()
+
+        session.processor = None
+
+
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
+
+    def shutdown(self):
+
+        print(
+            "[OUT] Shutdown solicitado"
+        )
+
+        self.running = False
+
+        # ----------------------------------------------------
+        # Obtener IDs
+        # ----------------------------------------------------
+
+        with self.sessions_lock:
+
+            call_ids = list(
+                self.sessions.keys()
+            )
+
+        # ----------------------------------------------------
+        # Limpiar
+        # ----------------------------------------------------
+
+        for call_id in call_ids:
+
+            try:
+
+                self._remove_session(
+                    call_id,
+                    reason="shutdown",
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[OUT] ERROR shutdown | "
+                    f"call={call_id} | "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+
+        # ----------------------------------------------------
+        # Esperar cleanup thread
+        # ----------------------------------------------------
+
+        if self.cleanup_thread.is_alive():
+
+            self.cleanup_thread.join(
+                timeout=2
+            )
+
+        print(
+            "[OUT] AudioOutService detenido"
+        )
+
+
+# ============================================================
+# SERVIDOR
+# ============================================================
+
+def serve(
+    host: str,
+    port: int,
+    block_active: bool,
+    call_timeout: int,
+):
+
+    # ========================================================
+    # SERVICIO
+    # ========================================================
+
+    service = AudioOutService(
+        block_active=block_active,
+        call_timeout=call_timeout,
+    )
+
+    # ========================================================
+    # gRPC SERVER
+    # ========================================================
+    #
+    # 50 workers para atender RPC.
+    #
+    # Esto NO limita la cantidad de call_id.
+    #
+    # ========================================================
+
+    server = grpc.server(
+        futures.ThreadPoolExecutor(
+            max_workers=50
+        )
+    )
+
+    audio_listener_pb2_grpc.add_SegmentOutputServicer_to_server(
+        service,
+        server,
+    )
+
+    address = f"{host}:{port}"
+
+    server.add_insecure_port(
+        address
+    )
+
+    server.start()
+
+    print()
+    print("========================================")
+    print("              AUDIO OUT")
+    print("========================================")
+    print()
+    print(
+        f"[OUT] Listening       : {address}"
+    )
+    print(
+        f"[OUT] block-active    : "
+        f"{block_active}"
+    )
+    print(
+        f"[OUT] Call timeout    : "
+        f"{call_timeout}s"
+    )
+    print(
+        "[OUT] Independent calls: ENABLED"
+    )
+    print(
+        "[OUT] Ping             : ENABLED"
+    )
+    print()
+
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
+
+    stop_event = threading.Event()
+
+    def signal_handler(
+        signum,
+        frame,
+    ):
+
+        print()
+        print(
+            "[OUT] Shutdown solicitado"
+        )
+
+        stop_event.set()
+
+    signal.signal(
+        signal.SIGINT,
+        signal_handler,
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        signal_handler,
+    )
+
+    try:
+
+        while not stop_event.is_set():
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+
+        pass
+
+    finally:
+
+        service.shutdown()
+
+        server.stop(
+            grace=5
+        )
+
+        print(
+            "[OUT] Server stopped"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Audio OUT concurrent server"
+    )
+
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="Host donde escucha Audio OUT",
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="Puerto de Audio OUT",
+    )
+
+    # ========================================================
+    # OPCIÓN PRINCIPAL
+    # ========================================================
+    #
+    # Si se especifica:
+    #
+    #     --block-active
+    #
+    # entonces:
+    #
+    # processListen activo
+    #       ↓
+    # nuevos segmentos
+    #       ↓
+    # IGNORADOS
+    #
+    # ========================================================
+
+    parser.add_argument(
+        "--block-active",
+        action="store_true",
+        help=(
+            "Ignora nuevas solicitudes de un call_id "
+            "mientras processListen está activo"
+        ),
+    )
+
+    # ========================================================
+    # TIMEOUT
+    # ========================================================
+
+    parser.add_argument(
+        "--call-timeout",
+        type=int,
+        default=DEFAULT_CALL_TIMEOUT,
+        help=(
+            "Segundos sin actividad antes de limpiar "
+            "la sesión. Default: 600"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    serve(
+        host=args.host,
+        port=args.port,
+        block_active=args.block_active,
+        call_timeout=args.call_timeout,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
