@@ -1,1108 +1,713 @@
-Claro. Para el tipo de trabajo que haces, yo plantearía el acceso en niveles, porque pedir sudo ALL puede ser difícil de aprobar en una empresa. La idea es que puedas desarrollar, compilar, instalar dependencias, levantar servicios, trabajar con Docker/GPU y diagnosticar problemas sin tener privilegios innecesarios.
+sudo nano /etc/gitea/app.ini
 
-1. Base: los comandos que pediría sí o sí
+[security]
+INSTALL_LOCK = true
 
-APT / paquetes
+[security]
+INSTALL_LOCK = false
 
-sudo apt update
-# Actualizar índices de paquetes.
+sudo systemctl restart gitea
 
-sudo apt upgrade
-# Actualizar paquetes instalados.
+http://IP_DEL_SERVIDOR:3000
 
-sudo apt install <paquete>
-# Instalar paquetes.
+Crear desde terminal
+sudo -u git /usr/local/bin/gitea admin user create \
+  --config /etc/gitea/app.ini \
+  --username admin \
+  --password 'TU_CLAVE_SEGURA' \
+  --email 'admin@localhost' \
+  --admin
 
-sudo apt remove <paquete>
-# Eliminar paquetes.
 
-sudo apt purge <paquete>
-# Eliminar paquete + archivos de configuración.
+Clonado de respositorios
 
-sudo apt autoremove
-# Eliminar dependencias que ya no se necesitan.
+Sí. Pero no copiaría simplemente /var/lib/gitea del servidor viejo. Como queremos conservar compatibilidad con el Git antiguo, primero hay que identificar exactamente qué tenemos y luego migrarlo de forma controlada.
 
-sudo apt reinstall <paquete>
-# Reinstalar un paquete.
+La estrategia que te recomiendo es:
 
-sudo apt-cache policy <paquete>
-# Ver versiones disponibles/instalada.
+No tocar el servidor viejo.
+Sacar un inventario de repositorios.
+Respaldar repositorios y configuración.
+Crear en el Gitea nuevo los usuarios/organizaciones.
+Migrar cada repositorio conservando:
+historial completo
+todas las ramas
+tags
+commits
+ramas remotas
+hooks si existen y son necesarios
+Git LFS, si lo utilizaban
+Probar clones y push desde un equipo cliente.
+Solo entonces hacer el cambio definitivo.
+Primero necesito saber cómo estaba montado el servidor viejo
 
-sudo apt-cache search <texto>
-# Buscar paquetes.
+En el servidor viejo, ejecuta este bloque:
 
-sudo dpkg -i <archivo.deb>
-# Instalar un .deb manualmente.
+echo "========== SISTEMA =========="
+cat /etc/os-release
+echo
 
-sudo dpkg -r <paquete>
-# Eliminar un paquete .deb.
+echo "========== GIT =========="
+git --version
+which git
+echo
 
-Para tu caso esto es muy importante, porque constantemente puedes necesitar:
+echo "========== USUARIO =========="
+whoami
+id
+echo
 
-build-essential
-gcc
-g++
-cmake
-ninja-build
-make
-git
-pkg-config
-python3-dev
-libssl-dev
-protobuf-compiler
-libgrpc++-dev
-CUDA-related packages
-FFmpeg
-libsndfile
-portaudio
+echo "========== PROCESOS GIT =========="
+ps aux | grep -Ei 'git|gitea|gitlab|gogs' | grep -v grep
+echo
+
+echo "========== SERVICIOS =========="
+systemctl list-units --type=service --all | grep -Ei 'git|gitea|gogs|gitlab'
+echo
+
+echo "========== PUERTOS =========="
+ss -lntp | grep -E ':22 |:80 |:443 |:3000 |:8080 '
+echo
+
+echo "========== DIRECTORIOS =========="
+ls -lah /home
+echo
+ls -lah /var/lib 2>/dev/null | grep -Ei 'git|gitea|gogs|gitlab'
+echo
+
+echo "========== REPOSITORIOS =========="
+find /home /srv /opt /var/lib -type d -name '*.git' 2>/dev/null | head -200
+
+
+No ejecutes todavía ningún mv, rm, git gc ni modificación en el servidor viejo.
+
+Si era un servidor Git "puro"
+
+Si el viejo simplemente tenía repositorios bare, por ejemplo:
+
+/srv/git/proyecto1.git
+/srv/git/proyecto2.git
+/srv/git/proyecto3.git
+
+
+entonces la migración es bastante sencilla. Podemos hacer un git clone --mirror desde el viejo hacia el nuevo:
+
+git clone --mirror usuario@SERVIDOR_VIEJO:/srv/git/proyecto1.git
+
+
+y posteriormente importar ese mirror en Gitea.
+
+Esto conserva el historial y las referencias Git, pero no necesariamente conserva cosas externas a Git, como usuarios, permisos, hooks personalizados o configuración del servidor.
+
+Si el viejo ya era Gitea/Gogs/GitLab
+
+Entonces no hagamos clone --mirror todavía.
+
+En ese caso puede existir una base de datos con:
+
+usuarios
+contraseñas/configuración de cuentas
+organizaciones
+permisos
+repositorios
+issues
+pull requests
+webhooks
+releases
 etc.
 
+Ahí podemos hacer una migración mucho más completa.
 
----
+Por eso el primer bloque de comandos es importante: quiero identificar qué teníamos antes de decidir el método de migración.
 
-2. Compilación C/C++
+Pásame la salida del bloque del servidor viejo y te preparo el siguiente .sh para hacer la migración al nuevo sin modificar el viejo.
 
-Para tus proyectos de s2.cpp, whisper.cpp, TEN-VAD, RNNoise, gRPC, etc.:
 
-sudo apt install build-essential
-# GCC/G++, make y herramientas básicas.
 
-sudo apt install gcc g++
-# Compiladores C/C++.
 
-sudo apt install cmake
-# Sistema de construcción CMake.
 
-sudo apt install ninja-build
-# Build system rápido.
 
-sudo apt install pkg-config
-# Detectar librerías instaladas.
+----------------------
 
-sudo ldconfig
-# Actualizar caché de librerías dinámicas.
 
-sudo update-alternatives --config gcc
-# Seleccionar versión de GCC.
+#!/usr/bin/env bash
 
-sudo update-alternatives --config g++
-# Seleccionar versión de G++.
+set -euo pipefail
 
-También:
+# ============================================================
+# Git Server + Gitea
+# Ubuntu
+#
+# Gitea: 1.27.3
+# Git:   2.22.5
+#
+# IMPORTANTE:
+# - No elimina repositorios existentes.
+# - No reemplaza /usr/bin/git.
+# - Instala Git 2.22.5 en /opt/git-2.22.5
+# - Gitea queda configurado para usar ese Git.
+# ============================================================
 
-sudo apt install autoconf automake libtool
-# Necesario para proyectos que utilizan autotools/autoreconf.
+GITEA_VERSION="1.27.3"
+GIT_VERSION="2.22.5"
 
-sudo apt install m4
-# Dependencia de herramientas de generación/configuración.
+GITEA_USER="git"
+GITEA_HOME="/home/git"
 
-sudo apt install flex bison
-# Generadores usados por algunos proyectos C/C++.
+GITEA_INSTALL="/usr/local/bin/gitea"
+GITEA_DATA="/var/lib/gitea"
+GITEA_CUSTOM="/var/lib/gitea/custom"
+GITEA_REPOS="/var/lib/gitea/git/repositories"
+GITEA_LOG="/var/lib/gitea/log"
+GITEA_CONFIG="/etc/gitea/app.ini"
 
-Esto te habría evitado, por ejemplo, errores del tipo:
+GIT_INSTALL="/opt/git-${GIT_VERSION}"
 
-autoreconf: not found
+GITEA_PORT="3000"
+SSH_PORT="22"
 
+# ------------------------------------------------------------
+# Colores
+# ------------------------------------------------------------
 
----
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
+}
+
+# ------------------------------------------------------------
+# Comprobaciones
+# ------------------------------------------------------------
+
+if [[ "${EUID}" -ne 0 ]]; then
+    error "Ejecuta este script como root: sudo bash $0"
+fi
+
+if [[ ! -f /etc/os-release ]]; then
+    error "No se pudo determinar la distribución Linux."
+fi
+
+source /etc/os-release
+
+if [[ "${ID}" != "ubuntu" ]]; then
+    warn "Este script está pensado para Ubuntu. Detectado: ${PRETTY_NAME}"
+fi
+
+ARCH="$(dpkg --print-architecture)"
+
+case "${ARCH}" in
+    amd64)
+        GITEA_ARCH="amd64"
+        ;;
+    arm64)
+        GITEA_ARCH="arm64"
+        ;;
+    *)
+        error "Arquitectura no soportada por este script: ${ARCH}"
+        ;;
+esac
+
+SERVER_IP="$(hostname -I | awk '{print $1}')"
+
+if [[ -z "${SERVER_IP}" ]]; then
+    SERVER_IP="127.0.0.1"
+fi
+
+info "Servidor detectado: ${SERVER_IP}"
+info "Arquitectura: ${ARCH}"
+info "Gitea: ${GITEA_VERSION}"
+info "Git: ${GIT_VERSION}"
+
+# ------------------------------------------------------------
+# Confirmación
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " INSTALACIÓN DEL SERVIDOR GIT"
+echo "============================================================"
+echo
+echo " Git        : ${GIT_VERSION}"
+echo " Gitea      : ${GITEA_VERSION}"
+echo " Web        : http://${SERVER_IP}:${GITEA_PORT}"
+echo " Repos      : ${GITEA_REPOS}"
+echo
+echo "IMPORTANTE:"
+echo "Este script instalará la infraestructura base."
+echo "NO se importarán todavía los repositorios antiguos."
+echo
+read -rp "¿Continuar? [y/N]: " CONFIRM
+
+if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
+    echo "Cancelado."
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# Paquetes
+# ------------------------------------------------------------
+
+info "Actualizando paquetes..."
+
+apt-get update
+
+apt-get install -y \
+    ca-certificates \
+    curl \
+    wget \
+    xz-utils \
+    tar \
+    gzip \
+    make \
+    gcc \
+    libc6-dev \
+    gettext \
+    zlib1g-dev \
+    libcurl4-openssl-dev \
+    libexpat1-dev \
+    libpcre2-dev \
+    libz-dev \
+    unzip \
+    sqlite3 \
+    openssh-server \
+    git
+
+# ------------------------------------------------------------
+# Usuario git
+# ------------------------------------------------------------
+
+if id "${GITEA_USER}" >/dev/null 2>&1; then
+    info "El usuario ${GITEA_USER} ya existe."
+else
+    info "Creando usuario ${GITEA_USER}..."
+
+    adduser \
+        --system \
+        --shell /bin/bash \
+        --gecos "Git Version Control" \
+        --group \
+        --disabled-password \
+        --home "${GITEA_HOME}" \
+        "${GITEA_USER}"
+fi
+
+# ------------------------------------------------------------
+# Directorios Gitea
+# ------------------------------------------------------------
+
+info "Creando estructura de directorios..."
+
+mkdir -p \
+    "${GITEA_DATA}" \
+    "${GITEA_CUSTOM}" \
+    "${GITEA_REPOS}" \
+    "${GITEA_LOG}" \
+    "${GITEA_DATA}/data"
 
-3. Python
+mkdir -p /etc/gitea
 
-Aquí hay una distinción importante: no deberías necesitar sudo para instalar paquetes Python dentro de un virtualenv.
+chown -R "${GITEA_USER}:${GITEA_USER}" "${GITEA_DATA}"
+chmod -R 750 "${GITEA_DATA}"
 
-Pero sí pediría:
+chown root:"${GITEA_USER}" /etc/gitea
+chmod 770 /etc/gitea
 
-sudo apt install python3
-# Python.
+# ------------------------------------------------------------
+# Instalar Git 2.22.5
+# ------------------------------------------------------------
 
-sudo apt install python3-pip
-# pip.
+if [[ -x "${GIT_INSTALL}/bin/git" ]]; then
 
-sudo apt install python3-venv
-# Crear virtual environments.
+    info "Git ${GIT_VERSION} ya está instalado."
 
-sudo apt install python3-dev
-# Headers necesarios para compilar extensiones Python.
+else
 
-sudo apt install python3-full
-# Instalación más completa de Python.
+    info "Instalando Git ${GIT_VERSION}..."
 
-Y:
+    TMP_DIR="$(mktemp -d)"
+    cd "${TMP_DIR}"
 
-sudo apt install python-is-python3
-# Hace que `python` apunte a Python 3.
+    GIT_TARBALL="git-${GIT_VERSION}.tar.xz"
+    GIT_URL="https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz"
 
-Después deberías poder trabajar normalmente:
+    wget -O "${GIT_TARBALL}" "${GIT_URL}"
 
-python3 -m venv .venv
-source .venv/bin/activate
+    tar -xf "${GIT_TARBALL}"
 
-pip install grpcio
-pip install torch
-pip install numpy
+    cd "git-${GIT_VERSION}"
 
-No recomiendo hacer:
+    # --------------------------------------------------------
+    # Git 2.22.5 es antiguo.
+    #
+    # Para evitar incompatibilidades con OpenSSL moderno
+    # del Ubuntu actual, el Git usado por Gitea se compila
+    # sin soporte HTTPS propio.
+    #
+    # Gitea maneja HTTP/HTTPS por su cuenta.
+    # Los clientes Git seguirán pudiendo conectarse a Gitea
+    # mediante HTTP/HTTPS/SSH.
+    # --------------------------------------------------------
 
-sudo pip install ...
+    info "Compilando Git ${GIT_VERSION}..."
 
-Eso termina mezclando el Python del sistema con tus proyectos.
+    make configure
 
+    ./configure \
+        --prefix="${GIT_INSTALL}" \
+        --without-tcltk
 
----
+    make -j"$(nproc)"
 
-4. Git
+    make install
 
-sudo apt install git
-# Git.
+    rm -rf "${TMP_DIR}"
 
-sudo apt install git-lfs
-# Git Large File Storage.
+fi
 
-sudo apt install ca-certificates
-# Certificados HTTPS.
+# ------------------------------------------------------------
+# Comprobar Git
+# ------------------------------------------------------------
 
-sudo apt install curl wget
-# Descargar archivos/repositorios.
+if [[ ! -x "${GIT_INSTALL}/bin/git" ]]; then
+    error "No se encontró el Git instalado en ${GIT_INSTALL}/bin/git"
+fi
 
-Y herramientas que utilizas mucho:
+INSTALLED_GIT="$("${GIT_INSTALL}/bin/git" --version)"
 
-sudo apt install unzip
-sudo apt install zip
-sudo apt install tar
-sudo apt install rsync
+info "Git instalado: ${INSTALLED_GIT}"
 
+# ------------------------------------------------------------
+# Enlaces Git auxiliares
+# ------------------------------------------------------------
 
----
+ln -sf "${GIT_INSTALL}/bin/git" "${GIT_INSTALL}/bin/git-receive-pack"
+ln -sf "${GIT_INSTALL}/bin/git" "${GIT_INSTALL}/bin/git-upload-pack"
+ln -sf "${GIT_INSTALL}/bin/git" "${GIT_INSTALL}/bin/git-upload-archive"
 
-5. Docker
+# ------------------------------------------------------------
+# Instalar Gitea
+# ------------------------------------------------------------
 
-Para tu trabajo, esto es crítico.
+info "Instalando Gitea ${GITEA_VERSION}..."
 
-Lo ideal no es que tengas que ejecutar:
+GITEA_BASE_URL="https://dl.gitea.com/gitea/${GITEA_VERSION}"
 
-sudo docker ...
+TMP_DIR="$(mktemp -d)"
+cd "${TMP_DIR}"
 
-constantemente.
+GITEA_FILE="gitea-${GITEA_VERSION}-linux-${GITEA_ARCH}.xz"
+GITEA_SHA="gitea-${GITEA_VERSION}-linux-${GITEA_ARCH}.xz.sha256"
 
-Pediría que tu usuario pertenezca al grupo Docker:
+wget -O "${GITEA_FILE}" \
+    "${GITEA_BASE_URL}/${GITEA_FILE}"
 
-sudo usermod -aG docker $USER
-# Agrega tu usuario al grupo docker.
+wget -O "${GITEA_SHA}" \
+    "${GITEA_BASE_URL}/${GITEA_SHA}"
 
-Después cerrar sesión y volver a entrar.
+info "Verificando checksum de Gitea..."
 
-Entonces:
+sha256sum -c "${GITEA_SHA}"
 
-docker ps
-docker images
-docker build
-docker run
-docker exec
-docker logs
-docker stop
-docker start
-docker restart
-docker rm
-docker rmi
+unxz "${GITEA_FILE}"
 
-sin sudo.
+install -m 755 \
+    "${GITEA_FILE%.xz}" \
+    "${GITEA_INSTALL}"
 
-Administración Docker
+rm -rf "${TMP_DIR}"
 
-También pediría capacidad para:
+# ------------------------------------------------------------
+# Verificar Gitea
+# ------------------------------------------------------------
 
-sudo systemctl status docker
-# Ver estado de Docker.
+"${GITEA_INSTALL}" --version
 
-sudo systemctl start docker
-# Iniciar Docker.
+# ------------------------------------------------------------
+# Permisos
+# ------------------------------------------------------------
 
-sudo systemctl stop docker
-# Detener Docker.
+chown root:root "${GITEA_INSTALL}"
+chmod 755 "${GITEA_INSTALL}"
 
-sudo systemctl restart docker
-# Reiniciar Docker.
+chown -R "${GITEA_USER}:${GITEA_USER}" "${GITEA_DATA}"
 
-sudo systemctl enable docker
-# Iniciar Docker automáticamente.
+chmod 750 "${GITEA_DATA}"
+chmod 770 /etc/gitea
 
-Y:
+# ------------------------------------------------------------
+# Configuración Gitea
+# ------------------------------------------------------------
 
-sudo journalctl -u docker
-# Logs de Docker.
+if [[ -f "${GITEA_CONFIG}" ]]; then
 
+    warn "Ya existe ${GITEA_CONFIG}"
+    warn "No se sobrescribirá."
 
----
+else
 
-6. Docker + NVIDIA
+    info "Generando configuración inicial de Gitea..."
 
-Para tus proyectos de TTS/LLM esto es indispensable.
+    cat > "${GITEA_CONFIG}" <<EOF
+APP_NAME = Git Server
 
-Necesitas poder comprobar:
+[server]
+APP_DATA_PATH = ${GITEA_DATA}/data
+DOMAIN = ${SERVER_IP}
+HTTP_ADDR = 0.0.0.0
+HTTP_PORT = ${GITEA_PORT}
+ROOT_URL = http://${SERVER_IP}:${GITEA_PORT}/
+DISABLE_SSH = false
+SSH_DOMAIN = ${SERVER_IP}
+SSH_PORT = ${SSH_PORT}
+START_SSH_SERVER = false
+LFS_START_SERVER = true
+OFFLINE_MODE = false
 
-nvidia-smi
-# Estado de GPU.
+[database]
+DB_TYPE = sqlite3
+PATH = ${GITEA_DATA}/data/gitea.db
 
-nvidia-smi -L
-# GPUs disponibles.
+[repository]
+ROOT = ${GITEA_REPOS}
+DEFAULT_BRANCH = main
+DEFAULT_PRIVATE = private
+ENABLE_PUSH_CREATE_USER = true
+ENABLE_PUSH_CREATE_ORG = false
 
-nvidia-smi -q
-# Información detallada.
+[repository.local]
+LOCAL_COPY_PATH = ${GITEA_DATA}/data/tmp/local-repo
 
-nvidia-smi dmon
-# Monitorización.
+[repository.upload]
+TEMP_PATH = ${GITEA_DATA}/data/uploads
 
-nvidia-smi pmon
-# Procesos utilizando GPU.
+[server]
+LANDING_PAGE = home
 
-Y Docker:
+[security]
+INSTALL_LOCK = true
+SECRET_KEY =
 
-docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+[service]
+DISABLE_REGISTRATION = true
+REQUIRE_SIGNIN_VIEW = false
+REGISTER_EMAIL_CONFIRM = false
+ENABLE_NOTIFY_MAIL = false
 
-También pediría que esté instalado/configurado:
+[mailer]
+ENABLED = false
 
-nvidia-container-toolkit
+[log]
+MODE = console
+LEVEL = Info
+ROOT_PATH = ${GITEA_LOG}
 
-Normalmente la configuración puede requerir:
+[session]
+PROVIDER = file
+PROVIDER_CONFIG = ${GITEA_DATA}/data/sessions
 
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
+[picture]
+AVATAR_UPLOAD_PATH = ${GITEA_DATA}/data/avatars
+REPOSITORY_AVATAR_UPLOAD_PATH = ${GITEA_DATA}/data/repo-avatars
 
+[attachment]
+PATH = ${GITEA_DATA}/data/attachments
 
----
+[lfs]
+PATH = ${GITEA_DATA}/data/lfs
 
-7. systemd / servicios .service
+[git]
+PATH = ${GIT_INSTALL}/bin/git
 
-Esto para ti es fundamental.
+[git.timeout]
+DEFAULT = 3600
+MIGRATE = 600
+MIRROR = 300
+CLONE = 300
+PULL = 300
+GC = 60
+EOF
 
-Pediría:
+    # Generar SECRET_KEY mediante Gitea
+    info "Generando SECRET_KEY..."
 
-sudo systemctl status <servicio>
-# Estado del servicio.
+    SECRET_KEY="$(
+        sudo -u "${GITEA_USER}" \
+        "${GITEA_INSTALL}" generate secret SECRET_KEY
+    )"
 
-sudo systemctl start <servicio>
-# Iniciar.
+    sed -i \
+        "s|^SECRET_KEY =.*|SECRET_KEY = ${SECRET_KEY}|" \
+        "${GITEA_CONFIG}"
 
-sudo systemctl stop <servicio>
-# Detener.
+fi
 
-sudo systemctl restart <servicio>
-# Reiniciar.
+chown root:"${GITEA_USER}" "${GITEA_CONFIG}"
+chmod 660 "${GITEA_CONFIG}"
 
-sudo systemctl reload <servicio>
-# Recargar configuración.
+# ------------------------------------------------------------
+# Configuración SSH para Gitea
+# ------------------------------------------------------------
 
-sudo systemctl enable <servicio>
-# Arranque automático.
+info "Preparando SSH..."
 
-sudo systemctl disable <servicio>
-# Quitar arranque automático.
+mkdir -p "${GITEA_HOME}/.ssh"
 
-sudo systemctl daemon-reload
-# Recargar archivos .service modificados.
+touch "${GITEA_HOME}/.ssh/authorized_keys"
 
-sudo systemctl is-active <servicio>
-# Saber si está activo.
+chown -R "${GITEA_USER}:${GITEA_USER}" "${GITEA_HOME}/.ssh"
 
-sudo systemctl is-enabled <servicio>
-# Saber si arranca automáticamente.
+chmod 700 "${GITEA_HOME}/.ssh"
+chmod 600 "${GITEA_HOME}/.ssh/authorized_keys"
 
-Especialmente:
+# ------------------------------------------------------------
+# Servicio systemd
+# ------------------------------------------------------------
 
-sudo systemctl edit <servicio>
-# Crear override de configuración.
+info "Creando servicio systemd..."
 
-sudo systemctl cat <servicio>
-# Ver configuración completa.
+cat > /etc/systemd/system/gitea.service <<EOF
+[Unit]
+Description=Gitea Git Server
+After=network.target
+After=sshd.service
 
-sudo systemctl list-units
-# Ver servicios/unidades.
+[Service]
+Type=simple
 
-sudo systemctl list-unit-files
-# Ver unidades instaladas.
+User=${GITEA_USER}
+Group=${GITEA_USER}
 
+WorkingDirectory=${GITEA_DATA}
 
----
+ExecStart=${GITEA_INSTALL} web --config ${GITEA_CONFIG}
 
-8. Logs — importantísimo
+Restart=always
+RestartSec=2s
 
-Para tus servicios gRPC, Docker, CUDA, etc.:
+Environment=USER=${GITEA_USER}
+Environment=HOME=${GITEA_HOME}
+Environment=GITEA_WORK_DIR=${GITEA_DATA}
+Environment=PATH=${GIT_INSTALL}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-sudo journalctl
-# Todos los logs disponibles.
+LimitNOFILE=65535
 
-sudo journalctl -u <servicio>
-# Logs de un servicio.
+[Install]
+WantedBy=multi-user.target
+EOF
 
-sudo journalctl -u <servicio> -f
-# Seguir logs en tiempo real.
+# ------------------------------------------------------------
+# Activar servicio
+# ------------------------------------------------------------
 
-sudo journalctl -u <servicio> -n 100
-# Últimas 100 líneas.
+systemctl daemon-reload
 
-sudo journalctl -u <servicio> --since today
-# Logs desde hoy.
+systemctl enable gitea
 
-sudo journalctl -u <servicio> --since "1 hour ago"
-# Última hora.
+systemctl restart gitea
 
-sudo journalctl -b
-# Logs desde el último arranque.
+sleep 5
 
-sudo journalctl -p err
-# Mostrar errores.
+# ------------------------------------------------------------
+# Comprobar servicio
+# ------------------------------------------------------------
 
-sudo journalctl --disk-usage
-# Espacio utilizado por journal.
+if systemctl is-active --quiet gitea; then
 
-También:
+    info "Gitea está ejecutándose correctamente."
 
-sudo dmesg
-# Mensajes del kernel.
+else
 
-sudo dmesg -T
-# dmesg con timestamps legibles.
+    echo
+    echo "============================================================"
+    echo " Gitea NO arrancó correctamente"
+    echo "============================================================"
+    echo
+    systemctl status gitea --no-pager
+    echo
+    echo "Logs:"
+    journalctl -u gitea -n 100 --no-pager
 
-sudo dmesg | grep -i nvidia
-# Problemas NVIDIA/kernel.
+    exit 1
+fi
 
-sudo dmesg | grep -i cuda
-# Buscar problemas relacionados con CUDA.
+# ------------------------------------------------------------
+# Firewall
+# ------------------------------------------------------------
 
+if command -v ufw >/dev/null 2>&1; then
 
----
+    if ufw status | grep -q "Status: active"; then
 
-9. Ver procesos
+        info "Abriendo puerto web ${GITEA_PORT}..."
 
-Para tus servicios concurrentes:
+        ufw allow "${GITEA_PORT}/tcp"
 
-ps aux
-# Procesos.
+        # SSH ya debería estar abierto normalmente
+        ufw allow "${SSH_PORT}/tcp"
 
-ps aux | grep <nombre>
-# Buscar proceso.
+    fi
+fi
 
-sudo ps aux
-# Procesos de todos los usuarios.
+# ------------------------------------------------------------
+# Comprobación final
+# ------------------------------------------------------------
 
-top
-# Monitorización.
+echo
+echo "============================================================"
+echo " INSTALACIÓN TERMINADA"
+echo "============================================================"
+echo
+echo "Gitea:"
+echo "  http://${SERVER_IP}:${GITEA_PORT}"
+echo
+echo "Git utilizado por Gitea:"
+echo "  ${GIT_INSTALL}/bin/git"
+echo
+echo "Versión:"
+echo "  $(${GIT_INSTALL}/bin/git --version)"
+echo
+echo "Repositorios:"
+echo "  ${GITEA_REPOS}"
+echo
+echo "Configuración:"
+echo "  ${GITEA_CONFIG}"
+echo
+echo "Servicio:"
+echo "  systemctl status gitea"
+echo
+echo "Logs:"
+echo "  journalctl -u gitea -f"
+echo
+echo "============================================================"
+echo
+echo "SIGUIENTE PASO:"
+echo
+echo "1. Abrir:"
+echo "   http://${SERVER_IP}:${GITEA_PORT}"
+echo
+echo "2. Crear el usuario administrador."
+echo
+echo "3. NO importar todavía los repositorios."
+echo
+echo "4. En la siguiente fase revisaremos el servidor Git antiguo"
+echo "   y prepararemos la migración sin perder ramas, tags,"
+echo "   usuarios, permisos ni historial."
+echo
+echo "============================================================"
 
-htop
-# Monitorización interactiva.
 
-sudo lsof
-# Archivos/puertos utilizados por procesos.
 
-sudo lsof -i :8001
-# Qué proceso usa el puerto 8001.
 
-sudo fuser -n tcp 8001
-# Proceso asociado al puerto.
-
-Y:
-
-sudo kill <PID>
-# Terminar proceso.
-
-sudo kill -9 <PID>
-# Forzar terminación.
-
-sudo pkill <nombre>
-# Terminar procesos por nombre.
-
-
----
-
-10. Red y puertos
-
-Muy útil para tus gRPC:
-
-sudo ss -tulpn
-# Puertos abiertos y procesos.
-
-sudo ss -ltnp
-# Puertos TCP escuchando.
-
-sudo ss -lunp
-# Puertos UDP.
-
-sudo lsof -i
-# Conexiones de red.
-
-sudo ip addr
-# Interfaces/red.
-
-sudo ip route
-# Tabla de rutas.
-
-sudo ip link
-# Interfaces.
-
-Firewall:
-
-sudo ufw status
-# Estado del firewall.
-
-sudo ufw status verbose
-# Estado detallado.
-
-sudo ufw allow 50051/tcp
-# Permitir puerto.
-
-sudo ufw delete allow 50051/tcp
-# Eliminar regla.
-
-Aquí recomendaría permiso limitado, porque modificar firewall puede afectar otros servicios de la empresa.
-
-
----
-
-11. DNS / conectividad
-
-ping <host>
-# Comprobar conectividad.
-
-curl http://localhost:8001
-# Probar HTTP.
-
-curl -v <URL>
-# Diagnóstico HTTP.
-
-wget <URL>
-# Descargar.
-
-dig <dominio>
-# Consultar DNS.
-
-nslookup <dominio>
-# Consultar DNS.
-
-traceroute <host>
-# Ver ruta de red.
-
-Instalación:
-
-sudo apt install dnsutils
-sudo apt install traceroute
-sudo apt install net-tools
-
-
----
-
-12. Usuarios y permisos
-
-Estos son muy importantes cuando trabajas con Docker, servicios y archivos.
-
-sudo chown <usuario>:<grupo> <archivo>
-# Cambiar propietario.
-
-sudo chown -R <usuario>:<grupo> <directorio>
-# Cambiar propietario recursivamente.
-
-sudo chmod <permisos> <archivo>
-# Cambiar permisos.
-
-sudo chmod -R <permisos> <directorio>
-# Cambiar permisos recursivamente.
-
-sudo usermod -aG <grupo> <usuario>
-# Agregar usuario a grupo.
-
-sudo groupadd <grupo>
-# Crear grupo.
-
-sudo useradd <usuario>
-# Crear usuario.
-
-Consultar:
-
-id
-# Tu usuario y grupos.
-
-groups
-# Grupos actuales.
-
-getent group docker
-# Usuarios pertenecientes a docker.
-
-getent passwd
-# Usuarios del sistema.
-
-
----
-
-13. Directorios del sistema
-
-Para instalar cosas:
-
-sudo mkdir /opt/<proyecto>
-# Crear directorio.
-
-sudo mkdir -p /opt/<proyecto>/models
-# Crear estructura.
-
-sudo cp <archivo> /opt/<proyecto>/
-# Copiar.
-
-sudo mv <archivo> /opt/<proyecto>/
-# Mover.
-
-sudo rm <archivo>
-# Eliminar.
-
-sudo rm -rf <directorio>
-# Eliminar directorio recursivamente.
-
-Ten mucho cuidado con:
-
-sudo rm -rf
-
-Yo no pediría un permiso sudo indiscriminado para rm si seguridad está intentando restringir privilegios.
-
-
----
-
-14. /opt, /srv, /var
-
-Para servicios propios normalmente pediría acceso a:
-
-/opt/
-/srv/
-/var/log/
-/etc/systemd/system/
-
-Por ejemplo:
-
-/opt/voicebot/
-/opt/llm/
-/opt/tts/
-/opt/stt/
-/srv/services/
-
-Pero idealmente la empresa puede darte propiedad sobre un directorio concreto, por ejemplo:
-
-/opt/development/
-
-en lugar de permitir modificar cualquier cosa de /opt.
-
-
----
-
-15. Cron
-
-Para tareas programadas:
-
-crontab -e
-# Editar cron del usuario.
-
-crontab -l
-# Ver cron del usuario.
-
-sudo crontab -l
-# Ver cron de root.
-
-sudo crontab -e
-# Editar cron de root.
-
-También:
-
-sudo systemctl status cron
-# Estado del servicio cron.
-
-sudo systemctl restart cron
-# Reiniciar cron.
-
-Para tu usuario, normalmente basta con:
-
-crontab -e
-crontab -l
-
-No necesitas sudo para tu propio cron.
-
-
----
-
-16. systemd timers
-
-Como alternativa moderna a cron:
-
-systemctl list-timers
-# Ver timers.
-
-sudo systemctl list-timers --all
-# Todos los timers.
-
-sudo systemctl start <timer>
-sudo systemctl stop <timer>
-sudo systemctl enable <timer>
-sudo systemctl disable <timer>
-
-
----
-
-17. Almacenamiento
-
-Esto te va a servir muchísimo con modelos de 5 GB, 10 GB, 20 GB, etc.
-
-df -h
-# Espacio disponible.
-
-df -ih
-# Inodos disponibles.
-
-du -sh <directorio>
-# Tamaño de directorio.
-
-sudo du -sh /var/*
-# Tamaño de /var.
-
-lsblk
-# Discos y particiones.
-
-sudo fdisk -l
-# Información de discos.
-
-sudo blkid
-# UUID/tipos de filesystem.
-
-mount
-# Sistemas montados.
-
-findmnt
-# Sistemas montados.
-
-Para Docker:
-
-docker system df
-# Espacio utilizado por Docker.
-
-docker system df -v
-# Detalle.
-
-
----
-
-18. Montajes
-
-Si trabajas con discos para modelos:
-
-sudo mount <dispositivo> <directorio>
-# Montar dispositivo.
-
-sudo umount <directorio>
-# Desmontar.
-
-sudo mount -a
-# Montar entradas de /etc/fstab.
-
-Y:
-
-sudo nano /etc/fstab
-
-Pero modificar /etc/fstab debería ser un permiso más restringido.
-
-
----
-
-19. Compresión y archivos
-
-tar -xvf archivo.tar
-# Extraer tar.
-
-tar -xzf archivo.tar.gz
-# Extraer tar.gz.
-
-sudo tar -xzf archivo.tar.gz -C /opt/
-# Extraer como root.
-
-gzip
-gunzip
-zip
-unzip
-
-
----
-
-20. SSH
-
-Para conectarte a otros servidores:
-
-ssh usuario@servidor
-# Conectar por SSH.
-
-scp archivo usuario@servidor:/ruta/
-# Copiar archivo.
-
-rsync -av archivo usuario@servidor:/ruta/
-# Sincronizar.
-
-ssh-keygen
-# Crear clave SSH.
-
-Si el equipo debe actuar como servidor:
-
-sudo systemctl status ssh
-sudo systemctl start ssh
-sudo systemctl enable ssh
-
-
----
-
-21. Variables de entorno y librerías
-
-Para problemas como:
-
-libcudnn.so
-libprotobuf.so
-libgrpc++.so
-libten_vad.so
-
-te interesa:
-
-ldconfig -p
-# Ver librerías conocidas.
-
-sudo ldconfig
-# Actualizar caché.
-
-ldd <ejecutable>
-# Ver dependencias dinámicas.
-
-printenv
-# Variables de entorno.
-
-env
-# Variables de entorno.
-
-Y:
-
-echo $LD_LIBRARY_PATH
-echo $PATH
-echo $CUDA_HOME
-
-
----
-
-22. CUDA
-
-En tus máquinas GPU:
-
-nvcc --version
-# Versión del compilador CUDA.
-
-nvidia-smi
-# Driver/GPU/CUDA soportada.
-
-which nvcc
-# Ubicación de nvcc.
-
-ls -l /usr/local/cuda
-# CUDA instalada.
-
-ls /usr/local/
-# Versiones CUDA.
-
-Instalación/actualización de CUDA normalmente requiere:
-
-sudo apt install ...
-
-pero yo no pediría permiso libre para cambiar drivers NVIDIA. Eso debería administrarlo IT.
-
-Un cambio incorrecto de driver puede dejarte sin GPU.
-
-
----
-
-23. Diagnóstico de GPU
-
-sudo nvidia-smi
-sudo nvidia-smi -q
-sudo nvidia-smi dmon
-sudo nvidia-smi pmon
-
-Y:
-
-sudo fuser -v /dev/nvidia*
-# Ver procesos utilizando dispositivos NVIDIA.
-
-Esto es particularmente útil cuando:
-
-CUDA out of memory
-GPU ocupada
-proceso zombie
-servicio que no libera VRAM
-
-
----
-
-24. Performance CPU
-
-lscpu
-# Información CPU.
-
-free -h
-# RAM.
-
-vmstat
-# Memoria/CPU/IO.
-
-iostat
-# IO.
-
-uptime
-# Carga.
-
-nproc
-# Número de CPUs.
-
-numactl --hardware
-# Topología NUMA.
-
-Puedes instalar:
-
-sudo apt install htop
-sudo apt install sysstat
-sudo apt install numactl
-
-
----
-
-25. Debugging de procesos
-
-Para tus C++:
-
-gdb <programa>
-# Debugger.
-
-sudo gdb -p <PID>
-# Adjuntar debugger a proceso.
-
-strace <programa>
-# Ver llamadas al sistema.
-
-sudo strace -p <PID>
-# Inspeccionar proceso existente.
-
-ltrace <programa>
-# Ver llamadas a librerías.
-
-Y:
-
-sudo perf
-# Profiling de rendimiento.
-
-Esto puede requerir permisos especiales según la configuración de seguridad del kernel.
-
-
----
-
-26. Core dumps
-
-Muy útil si un servidor C++ se cae:
-
-ulimit -c
-# Ver configuración de core dumps.
-
-sudo coredumpctl list
-# Core dumps disponibles.
-
-sudo coredumpctl info <PID>
-# Información del crash.
-
-sudo coredumpctl debug <PID>
-# Abrir crash en debugger.
-
-
----
-
-27. Procesos que ocupan puertos
-
-Esto lo vas a utilizar muchísimo:
-
-sudo ss -ltnp | grep 50051
-
-o:
-
-sudo lsof -i :50051
-
-Después:
-
-sudo kill <PID>
-
-
----
-
-28. Servicios que no arrancan
-
-Tu checklist sería:
-
-sudo systemctl status mi-servicio
-
-luego:
-
-sudo journalctl -u mi-servicio -n 200
-
-y:
-
-sudo journalctl -u mi-servicio -f
-
-y finalmente:
-
-sudo systemctl cat mi-servicio
-
-Esto cubre una enorme cantidad de problemas.
-
-
----
-
-29. Variables y secretos
-
-Para servicios que utilizan .env, modelos, certificados, etc.:
-
-sudo ls -la /ruta
-sudo cat /ruta/config
-sudo chown
-sudo chmod
-
-Pero no recomiendo que tu sudoers permita leer indiscriminadamente:
-
-/etc/shadow
-/etc/ssh/*
-/root/*
-
-porque no necesitas eso para desarrollar.
-
-
----
-
-30. Lo que yo pediría exactamente a IT
-
-En lugar de decir:
-
-> "Necesito sudo completo."
-
-
-
-llevaría algo parecido a esto:
-
-Necesito permisos administrativos para:
-
-1. Gestión de paquetes:
-   apt, apt-get, dpkg
-
-2. Desarrollo:
-   gcc, g++, cmake, make, ninja, ldconfig
-
-3. Python:
-   instalación de python3, python3-dev, python3-venv
-
-4. Docker:
-   configuración y administración de Docker
-   acceso del usuario al grupo docker
-   NVIDIA Container Toolkit
-
-5. GPU:
-   acceso a nvidia-smi y diagnóstico de GPU
-   sin necesidad de modificar drivers NVIDIA salvo autorización de IT
-
-6. systemd:
-   administrar mis servicios de desarrollo
-   systemctl start/stop/restart/status/enable/disable
-   daemon-reload
-   journalctl
-
-7. Logs:
-   lectura de logs de mis servicios
-   journalctl
-   dmesg
-
-8. Red:
-   diagnóstico de puertos/conexiones
-   ss, lsof, ip, etc.
-
-9. Archivos:
-   administración de /opt/<mi-proyecto>
-   /srv/<mi-proyecto>
-   /var/log/<mi-proyecto>
-
-10. Cron:
-    administración de mis tareas programadas.
-
-11. Diagnóstico:
-    gdb, strace, perf, coredumpctl.
-
-12. Almacenamiento:
-    df, du, lsblk, mount cuando sea necesario.
-
-
----
-
-31. Pero hay una opción mucho mejor: sudoers restringido
-
-Si la empresa no quiere darte sudo total, puedes pedir que IT cree algo como:
-
-/etc/sudoers.d/developer
-
-con permisos específicamente para tus necesidades.
-
-Por ejemplo, conceptualmente:
-
-developer ALL=(root) /usr/bin/systemctl
-developer ALL=(root) /usr/bin/journalctl
-developer ALL=(root) /usr/bin/apt
-developer ALL=(root) /usr/bin/dpkg
-developer ALL=(root) /usr/bin/docker
-developer ALL=(root) /usr/bin/nvidia-smi
-developer ALL=(root) /usr/sbin/ldconfig
-
-Pero ojo: no recomiendo que copies esto directamente a producción. systemctl, apt, docker, etc. pueden permitir escalar privilegios indirectamente si se configuran sin restricciones. Lo correcto es que IT defina comandos, servicios y rutas permitidos.
-
-
----
-
-32. En tu caso concreto, yo separaría los permisos así
-
-Área	Necesidad
-
-apt install	🔴 Muy importante
-gcc/g++/cmake	🔴 Muy importante
-Python/venv	🔴 Muy importante
-Docker	🔴 Crítico
-NVIDIA Container Toolkit	🔴 Crítico para GPU
-nvidia-smi	🔴 Crítico
-systemctl	🔴 Crítico
-journalctl	🔴 Crítico
-ss/lsof	🔴 Muy importante
-chown/chmod	🔴 Muy importante
-/opt/proyecto	🔴 Muy importante
-/var/log/proyecto	🟠 Importante
-cron	🟠 Importante
-systemd timers	🟠 Importante
-gdb	🟠 Importante
-strace	🟠 Importante
-perf	🟠 Importante
-mount	🟡 Según infraestructura
-firewall	🟡 Según infraestructura
-modificar drivers NVIDIA	🟡 Mejor IT
-/etc/shadow	❌ No necesario
-/root	❌ No necesario
-sudo ALL=(ALL) ALL	❌ Evitar si no es necesario
-
-
-Y algo especialmente importante para ti
-
-Yo intentaría conseguir tres cosas antes que sudo total:
-
-# 1. Docker sin sudo
-sudo usermod -aG docker $USER
-
-# 2. Directorio de desarrollo bajo tu control
-/opt/development/<usuario>/
-
-# 3. Tus propios servicios systemd
-/etc/systemd/system/<tus-servicios>.service
-
-Porque con eso puedes hacer prácticamente todo tu flujo de Python → C++ → CUDA → gRPC → Docker → systemd → logs → monitoreo, sin convertir tu usuario en administrador absoluto.
-
-Si IT te permite sudo total temporalmente para configurar el equipo, también es razonable pedirlo inicialmente y después pasar a un sudoers restringido cuando el entorno ya esté definido.
