@@ -1,834 +1,1108 @@
-#!/usr/bin/env python3
+Claro. Para el tipo de trabajo que haces, yo plantearía el acceso en niveles, porque pedir sudo ALL puede ser difícil de aprobar en una empresa. La idea es que puedas desarrollar, compilar, instalar dependencias, levantar servicios, trabajar con Docker/GPU y diagnosticar problemas sin tener privilegios innecesarios.
 
-import argparse
-import asyncio
-import inspect
-import json
-import signal
-import time
-from dataclasses import dataclass, field
-from typing import Optional
+1. Base: los comandos que pediría sí o sí
 
-import grpc
+APT / paquetes
 
-import audio_listener_pb2
-import audio_listener_pb2_grpc
+sudo apt update
+# Actualizar índices de paquetes.
 
-# Ajusta este import al nombre real de tu clase
-from worker_process import workerProcess
+sudo apt upgrade
+# Actualizar paquetes instalados.
 
+sudo apt install <paquete>
+# Instalar paquetes.
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
+sudo apt remove <paquete>
+# Eliminar paquetes.
 
-SESSION_TIMEOUT_SECONDS = 10 * 60
-CLEANUP_INTERVAL_SECONDS = 30
+sudo apt purge <paquete>
+# Eliminar paquete + archivos de configuración.
 
+sudo apt autoremove
+# Eliminar dependencias que ya no se necesitan.
 
-# ============================================================
-# SESIÓN
-# ============================================================
+sudo apt reinstall <paquete>
+# Reinstalar un paquete.
 
-@dataclass
-class CallSession:
-    call_id: str
+sudo apt-cache policy <paquete>
+# Ver versiones disponibles/instalada.
 
-    metadata_json: str = ""
+sudo apt-cache search <texto>
+# Buscar paquetes.
 
-    created_at: float = field(default_factory=time.monotonic)
-    last_activity: float = field(default_factory=time.monotonic)
+sudo dpkg -i <archivo.deb>
+# Instalar un .deb manualmente.
 
-    processor: Optional[workerProcess] = None
+sudo dpkg -r <paquete>
+# Eliminar un paquete .deb.
 
-    processing: bool = False
-    cleanup_requested: bool = False
+Para tu caso esto es muy importante, porque constantemente puedes necesitar:
 
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+build-essential
+gcc
+g++
+cmake
+ninja-build
+make
+git
+pkg-config
+python3-dev
+libssl-dev
+protobuf-compiler
+libgrpc++-dev
+CUDA-related packages
+FFmpeg
+libsndfile
+portaudio
+etc.
 
-    def touch(self):
-        self.last_activity = time.monotonic()
 
-    def idle_seconds(self) -> float:
-        return time.monotonic() - self.last_activity
+---
 
+2. Compilación C/C++
 
-# ============================================================
-# SERVICIO gRPC
-# ============================================================
+Para tus proyectos de s2.cpp, whisper.cpp, TEN-VAD, RNNoise, gRPC, etc.:
 
-class AudioOutService(audio_listener_pb2_grpc.SegmentOutputServicer):
+sudo apt install build-essential
+# GCC/G++, make y herramientas básicas.
 
-    def __init__(
-        self,
-        block_active: bool = False,
-    ):
-        self.block_active = block_active
+sudo apt install gcc g++
+# Compiladores C/C++.
 
-        self.sessions: dict[str, CallSession] = {}
+sudo apt install cmake
+# Sistema de construcción CMake.
 
-        # Protege creación/eliminación de sesiones
-        self.sessions_lock = asyncio.Lock()
+sudo apt install ninja-build
+# Build system rápido.
 
-        self.cleanup_task: Optional[asyncio.Task] = None
+sudo apt install pkg-config
+# Detectar librerías instaladas.
 
-        self.running = True
+sudo ldconfig
+# Actualizar caché de librerías dinámicas.
 
-    # --------------------------------------------------------
-    # START
-    # --------------------------------------------------------
+sudo update-alternatives --config gcc
+# Seleccionar versión de GCC.
 
-    async def start(self):
-        self.cleanup_task = asyncio.create_task(
-            self._cleanup_loop()
-        )
+sudo update-alternatives --config g++
+# Seleccionar versión de G++.
 
-        print(
-            f"[OUT] Servicio iniciado | "
-            f"block_active={self.block_active}"
-        )
+También:
 
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
+sudo apt install autoconf automake libtool
+# Necesario para proyectos que utilizan autotools/autoreconf.
 
-    async def stop(self):
-        self.running = False
+sudo apt install m4
+# Dependencia de herramientas de generación/configuración.
 
-        if self.cleanup_task:
-            self.cleanup_task.cancel()
+sudo apt install flex bison
+# Generadores usados por algunos proyectos C/C++.
 
-            try:
-                await self.cleanup_task
-            except asyncio.CancelledError:
-                pass
+Esto te habría evitado, por ejemplo, errores del tipo:
 
-            self.cleanup_task = None
+autoreconf: not found
 
-        async with self.sessions_lock:
-            sessions = list(self.sessions.values())
-            self.sessions.clear()
 
-        print(
-            f"[OUT] Cerrando {len(sessions)} sesiones..."
-        )
+---
 
-        # Limpieza concurrente
-        await asyncio.gather(
-            *(self._cleanup_session(session) for session in sessions),
-            return_exceptions=True,
-        )
+3. Python
 
-        print("[OUT] Servicio detenido")
+Aquí hay una distinción importante: no deberías necesitar sudo para instalar paquetes Python dentro de un virtualenv.
 
-    # --------------------------------------------------------
-    # OBTENER / CREAR SESIÓN
-    # --------------------------------------------------------
+Pero sí pediría:
 
-    async def _get_or_create_session(
-        self,
-        call_id: str,
-    ) -> CallSession:
+sudo apt install python3
+# Python.
 
-        async with self.sessions_lock:
+sudo apt install python3-pip
+# pip.
 
-            session = self.sessions.get(call_id)
+sudo apt install python3-venv
+# Crear virtual environments.
 
-            if session is not None:
-                return session
+sudo apt install python3-dev
+# Headers necesarios para compilar extensiones Python.
 
-            print(
-                f"[OUT] Nueva sesión | call_id={call_id}"
-            )
+sudo apt install python3-full
+# Instalación más completa de Python.
 
-            session = CallSession(
-                call_id=call_id
-            )
+Y:
 
-            session.processor = workerProcess()
+sudo apt install python-is-python3
+# Hace que `python` apunte a Python 3.
 
-            self.sessions[call_id] = session
+Después deberías poder trabajar normalmente:
 
-            return session
+python3 -m venv .venv
+source .venv/bin/activate
 
-    # --------------------------------------------------------
-    # METADATA
-    # --------------------------------------------------------
+pip install grpcio
+pip install torch
+pip install numpy
 
-    @staticmethod
-    def _validate_metadata(
-        metadata_json: str,
-    ) -> bool:
+No recomiendo hacer:
 
-        if not metadata_json:
-            print("[OUT] Metadata vacía")
-            return False
+sudo pip install ...
 
-        try:
-            metadata = json.loads(metadata_json)
+Eso termina mezclando el Python del sistema con tus proyectos.
 
-        except json.JSONDecodeError as exc:
-            print(
-                f"[OUT] Metadata JSON inválida: {exc}"
-            )
-            return False
 
-        if not isinstance(metadata, dict):
-            print("[OUT] Metadata debe ser un objeto JSON")
-            return False
+---
 
-        return True
+4. Git
 
-    # --------------------------------------------------------
-    # PROCESAMIENTO
-    # --------------------------------------------------------
+sudo apt install git
+# Git.
 
-    async def _call_worker(
-        self,
-        session: CallSession,
-    ):
-        """
-        Ejecuta processListen() de forma completamente asíncrona.
+sudo apt install git-lfs
+# Git Large File Storage.
 
-        IMPORTANTE:
-        processListen() debe ser async.
-        """
+sudo apt install ca-certificates
+# Certificados HTTPS.
 
-        try:
+sudo apt install curl wget
+# Descargar archivos/repositorios.
 
-            print(
-                f"[OUT] Iniciando processListen | "
-                f"call_id={session.call_id}"
-            )
+Y herramientas que utilizas mucho:
 
-            session.processing = True
+sudo apt install unzip
+sudo apt install zip
+sudo apt install tar
+sudo apt install rsync
 
-            # ------------------------------------------------
-            # AQUÍ ESTÁ TU PROCESO REAL
-            # ------------------------------------------------
 
-            result = session.processor.processListen(
-                session.call_id,
-                session.metadata_json,
-            )
+---
 
-            # Soporta tanto:
-            #
-            # async def processListen(...)
-            #
-            # como una función que devuelva una coroutine.
-            #
-            if inspect.isawaitable(result):
-                await result
+5. Docker
 
-            print(
-                f"[OUT] processListen terminado | "
-                f"call_id={session.call_id}"
-            )
+Para tu trabajo, esto es crítico.
 
-        except asyncio.CancelledError:
+Lo ideal no es que tengas que ejecutar:
 
-            print(
-                f"[OUT] processListen cancelado | "
-                f"call_id={session.call_id}"
-            )
+sudo docker ...
 
-            raise
+constantemente.
 
-        except Exception as exc:
+Pediría que tu usuario pertenezca al grupo Docker:
 
-            print(
-                f"[OUT] Error processListen | "
-                f"call_id={session.call_id} | "
-                f"{type(exc).__name__}: {exc}"
-            )
+sudo usermod -aG docker $USER
+# Agrega tu usuario al grupo docker.
 
-        finally:
+Después cerrar sesión y volver a entrar.
 
-            session.processing = False
+Entonces:
 
-            # Si durante el procesamiento la sesión quedó
-            # marcada para limpieza, se limpia ahora.
-            if session.cleanup_requested:
-                await self._remove_session_if_inactive(
-                    session
-                )
+docker ps
+docker images
+docker build
+docker run
+docker exec
+docker logs
+docker stop
+docker start
+docker restart
+docker rm
+docker rmi
 
-    # --------------------------------------------------------
-    # VALIDAR ESTADO DEL PROCESSOR
-    # --------------------------------------------------------
+sin sudo.
 
-    @staticmethod
-    def _processor_is_active(
-        session: CallSession,
-    ) -> bool:
+Administración Docker
 
-        # Nuestro estado interno
-        if session.processing:
-            return True
+También pediría capacidad para:
 
-        processor = session.processor
+sudo systemctl status docker
+# Ver estado de Docker.
 
-        if processor is None:
-            return False
+sudo systemctl start docker
+# Iniciar Docker.
 
-        # Si workerProcess tiene status,
-        # lo usamos como validación adicional.
-        try:
+sudo systemctl stop docker
+# Detener Docker.
 
-            status = processor.status
+sudo systemctl restart docker
+# Reiniciar Docker.
 
-            if isinstance(status, bool):
-                return status
+sudo systemctl enable docker
+# Iniciar Docker automáticamente.
 
-            if isinstance(status, str):
+Y:
 
-                status = status.lower().strip()
+sudo journalctl -u docker
+# Logs de Docker.
 
-                return status in {
-                    "processing",
-                    "active",
-                    "running",
-                    "busy",
-                    "working",
-                }
 
-        except Exception:
-            pass
+---
 
-        return False
+6. Docker + NVIDIA
 
-    # --------------------------------------------------------
-    # SEND SEGMENT
-    # --------------------------------------------------------
+Para tus proyectos de TTS/LLM esto es indispensable.
 
-    async def SendSegment(
-        self,
-        request,
-        context,
-    ):
-        """
-        Recibe un segmento desde TEN VAD.
+Necesitas poder comprobar:
 
-        Esta función NO espera a que processListen()
-        termine.
+nvidia-smi
+# Estado de GPU.
 
-        Solo inicia el proceso y responde inmediatamente.
-        """
+nvidia-smi -L
+# GPUs disponibles.
 
-        call_id = request.call_id
+nvidia-smi -q
+# Información detallada.
 
-        if not call_id:
+nvidia-smi dmon
+# Monitorización.
 
-            return audio_listener_pb2.SegmentResponse(
-                success=False
-            )
+nvidia-smi pmon
+# Procesos utilizando GPU.
 
-        if not request.audio:
+Y Docker:
 
-            print(
-                f"[OUT] Audio vacío | "
-                f"call_id={call_id}"
-            )
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 
-            return audio_listener_pb2.SegmentResponse(
-                success=False
-            )
+También pediría que esté instalado/configurado:
 
-        metadata_json = request.metadata_json
+nvidia-container-toolkit
 
-        if not self._validate_metadata(
-            metadata_json
-        ):
+Normalmente la configuración puede requerir:
 
-            return audio_listener_pb2.SegmentResponse(
-                success=False
-            )
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
 
-        # ----------------------------------------------------
-        # Obtener sesión
-        # ----------------------------------------------------
 
-        session = await self._get_or_create_session(
-            call_id
-        )
+---
 
-        # ----------------------------------------------------
-        # Actualizar actividad
-        # ----------------------------------------------------
+7. systemd / servicios .service
 
-        async with session.lock:
+Esto para ti es fundamental.
 
-            session.touch()
+Pediría:
 
-            session.cleanup_requested = False
+sudo systemctl status <servicio>
+# Estado del servicio.
 
-            # Guardamos siempre la metadata más reciente.
-            session.metadata_json = metadata_json
+sudo systemctl start <servicio>
+# Iniciar.
 
-            # ------------------------------------------------
-            # BLOQUEO OPCIONAL
-            # ------------------------------------------------
+sudo systemctl stop <servicio>
+# Detener.
 
-            if self.block_active:
+sudo systemctl restart <servicio>
+# Reiniciar.
 
-                if self._processor_is_active(session):
+sudo systemctl reload <servicio>
+# Recargar configuración.
 
-                    print(
-                        f"[OUT] IGNORADO | "
-                        f"call_id={call_id} | "
-                        f"processListen activo"
-                    )
+sudo systemctl enable <servicio>
+# Arranque automático.
 
-                    # El transporte gRPC funcionó correctamente.
-                    #
-                    # No devolvemos false porque eso podría hacer
-                    # que TEN VAD interprete que el OUT falló.
-                    return audio_listener_pb2.SegmentResponse(
-                        success=True
-                    )
+sudo systemctl disable <servicio>
+# Quitar arranque automático.
 
-                # --------------------------------------------
-                # Iniciar proceso
-                # --------------------------------------------
+sudo systemctl daemon-reload
+# Recargar archivos .service modificados.
 
-                asyncio.create_task(
-                    self._call_worker(session)
-                )
+sudo systemctl is-active <servicio>
+# Saber si está activo.
 
-            else:
+sudo systemctl is-enabled <servicio>
+# Saber si arranca automáticamente.
 
-                # ------------------------------------------------
-                # MODO NO BLOQUEANTE
-                # ------------------------------------------------
-                #
-                # Si el proceso anterior sigue activo,
-                # NO usamos el mismo processor.
-                #
-                # Creamos otro workerProcess para que dos
-                # processListen() no compartan estado.
-                # ------------------------------------------------
+Especialmente:
 
-                if self._processor_is_active(session):
+sudo systemctl edit <servicio>
+# Crear override de configuración.
 
-                    print(
-                        f"[OUT] Nueva ejecución paralela | "
-                        f"call_id={call_id}"
-                    )
+sudo systemctl cat <servicio>
+# Ver configuración completa.
 
-                    processor = workerProcess()
+sudo systemctl list-units
+# Ver servicios/unidades.
 
-                    asyncio.create_task(
-                        self._call_worker_with_processor(
-                            session,
-                            processor,
-                        )
-                    )
+sudo systemctl list-unit-files
+# Ver unidades instaladas.
 
-                else:
 
-                    asyncio.create_task(
-                        self._call_worker(session)
-                    )
+---
 
-        # ----------------------------------------------------
-        # RESPONDER INMEDIATAMENTE
-        # ----------------------------------------------------
+8. Logs — importantísimo
 
-        return audio_listener_pb2.SegmentResponse(
-            success=True
-        )
+Para tus servicios gRPC, Docker, CUDA, etc.:
 
-    # --------------------------------------------------------
-    # WORKER CON PROCESSOR INDEPENDIENTE
-    # --------------------------------------------------------
+sudo journalctl
+# Todos los logs disponibles.
 
-    async def _call_worker_with_processor(
-        self,
-        session: CallSession,
-        processor,
-    ):
+sudo journalctl -u <servicio>
+# Logs de un servicio.
 
-        try:
+sudo journalctl -u <servicio> -f
+# Seguir logs en tiempo real.
 
-            print(
-                f"[OUT] processListen paralelo | "
-                f"call_id={session.call_id}"
-            )
+sudo journalctl -u <servicio> -n 100
+# Últimas 100 líneas.
 
-            result = processor.processListen(
-                session.call_id,
-                session.metadata_json,
-            )
+sudo journalctl -u <servicio> --since today
+# Logs desde hoy.
 
-            if inspect.isawaitable(result):
-                await result
+sudo journalctl -u <servicio> --since "1 hour ago"
+# Última hora.
 
-            print(
-                f"[OUT] processListen paralelo terminado | "
-                f"call_id={session.call_id}"
-            )
+sudo journalctl -b
+# Logs desde el último arranque.
 
-        except asyncio.CancelledError:
+sudo journalctl -p err
+# Mostrar errores.
 
-            raise
+sudo journalctl --disk-usage
+# Espacio utilizado por journal.
 
-        except Exception as exc:
+También:
 
-            print(
-                f"[OUT] Error processListen paralelo | "
-                f"call_id={session.call_id} | "
-                f"{type(exc).__name__}: {exc}"
-            )
+sudo dmesg
+# Mensajes del kernel.
 
-        finally:
+sudo dmesg -T
+# dmesg con timestamps legibles.
 
-            await self._cleanup_processor(
-                processor
-            )
+sudo dmesg | grep -i nvidia
+# Problemas NVIDIA/kernel.
 
-    # --------------------------------------------------------
-    # CLEANUP PROCESSOR
-    # --------------------------------------------------------
+sudo dmesg | grep -i cuda
+# Buscar problemas relacionados con CUDA.
 
-    @staticmethod
-    async def _cleanup_processor(
-        processor,
-    ):
 
-        if processor is None:
-            return
+---
 
-        try:
+9. Ver procesos
 
-            # Si tu workerProcess tiene cleanup()
-            cleanup = getattr(
-                processor,
-                "cleanup",
-                None,
-            )
+Para tus servicios concurrentes:
 
-            if cleanup:
+ps aux
+# Procesos.
 
-                result = cleanup()
+ps aux | grep <nombre>
+# Buscar proceso.
 
-                if inspect.isawaitable(result):
-                    await result
+sudo ps aux
+# Procesos de todos los usuarios.
 
-                return
+top
+# Monitorización.
 
-            # Alternativa: close()
-            close = getattr(
-                processor,
-                "close",
-                None,
-            )
+htop
+# Monitorización interactiva.
 
-            if close:
+sudo lsof
+# Archivos/puertos utilizados por procesos.
 
-                result = close()
+sudo lsof -i :8001
+# Qué proceso usa el puerto 8001.
 
-                if inspect.isawaitable(result):
-                    await result
+sudo fuser -n tcp 8001
+# Proceso asociado al puerto.
 
-                return
+Y:
 
-        except Exception as exc:
+sudo kill <PID>
+# Terminar proceso.
 
-            print(
-                f"[OUT] Error limpiando processor: "
-                f"{type(exc).__name__}: {exc}"
-            )
+sudo kill -9 <PID>
+# Forzar terminación.
 
-    # --------------------------------------------------------
-    # REMOVE SESSION
-    # --------------------------------------------------------
+sudo pkill <nombre>
+# Terminar procesos por nombre.
 
-    async def _remove_session_if_inactive(
-        self,
-        session: CallSession,
-    ):
 
-        async with session.lock:
+---
 
-            # Volvió a tener actividad
-            if session.idle_seconds() < SESSION_TIMEOUT_SECONDS:
-                session.cleanup_requested = False
-                return
+10. Red y puertos
 
-            # Todavía procesando
-            if self._processor_is_active(session):
+Muy útil para tus gRPC:
 
-                session.cleanup_requested = True
+sudo ss -tulpn
+# Puertos abiertos y procesos.
 
-                return
+sudo ss -ltnp
+# Puertos TCP escuchando.
 
-            session_id = session.call_id
+sudo ss -lunp
+# Puertos UDP.
 
-            async with self.sessions_lock:
+sudo lsof -i
+# Conexiones de red.
 
-                current = self.sessions.get(
-                    session_id
-                )
+sudo ip addr
+# Interfaces/red.
 
-                # Verificamos que siga siendo
-                # exactamente la misma sesión.
-                if current is not session:
-                    return
+sudo ip route
+# Tabla de rutas.
 
-                self.sessions.pop(
-                    session_id,
-                    None
-                )
+sudo ip link
+# Interfaces.
 
-            print(
-                f"[OUT] Sesión eliminada | "
-                f"call_id={session_id} | "
-                f"inactiva={session.idle_seconds():.1f}s"
-            )
+Firewall:
 
-            await self._cleanup_processor(
-                session.processor
-            )
+sudo ufw status
+# Estado del firewall.
 
-            session.processor = None
+sudo ufw status verbose
+# Estado detallado.
 
-    # --------------------------------------------------------
-    # CLEANUP LOOP
-    # --------------------------------------------------------
+sudo ufw allow 50051/tcp
+# Permitir puerto.
 
-    async def _cleanup_loop(self):
+sudo ufw delete allow 50051/tcp
+# Eliminar regla.
 
-        try:
+Aquí recomendaría permiso limitado, porque modificar firewall puede afectar otros servicios de la empresa.
 
-            while self.running:
 
-                await asyncio.sleep(
-                    CLEANUP_INTERVAL_SECONDS
-                )
+---
 
-                async with self.sessions_lock:
-                    sessions = list(
-                        self.sessions.values()
-                    )
+11. DNS / conectividad
 
-                # Todas las sesiones se revisan
-                # concurrentemente.
-                await asyncio.gather(
-                    *(
-                        self._check_session_timeout(session)
-                        for session in sessions
-                    ),
-                    return_exceptions=True,
-                )
+ping <host>
+# Comprobar conectividad.
 
-        except asyncio.CancelledError:
+curl http://localhost:8001
+# Probar HTTP.
 
-            raise
+curl -v <URL>
+# Diagnóstico HTTP.
 
-    # --------------------------------------------------------
-    # CHECK SESSION
-    # --------------------------------------------------------
+wget <URL>
+# Descargar.
 
-    async def _check_session_timeout(
-        self,
-        session: CallSession,
-    ):
+dig <dominio>
+# Consultar DNS.
 
-        if session.idle_seconds() < SESSION_TIMEOUT_SECONDS:
-            return
+nslookup <dominio>
+# Consultar DNS.
 
-        print(
-            f"[OUT] Sesión inactiva > "
-            f"{SESSION_TIMEOUT_SECONDS}s | "
-            f"call_id={session.call_id}"
-        )
+traceroute <host>
+# Ver ruta de red.
 
-        await self._remove_session_if_inactive(
-            session
-        )
+Instalación:
 
-    # --------------------------------------------------------
-    # PING
-    # --------------------------------------------------------
+sudo apt install dnsutils
+sudo apt install traceroute
+sudo apt install net-tools
 
-    async def Ping(
-        self,
-        request,
-        context,
-    ):
 
-        print(
-            f"[OUT] Ping received | "
-            f"source={request.source}"
-        )
+---
 
-        return audio_listener_pb2.PingResponse(
-            success=True,
-            service="audio-out",
-            message="OUT is alive",
-        )
+12. Usuarios y permisos
 
+Estos son muy importantes cuando trabajas con Docker, servicios y archivos.
 
-# ============================================================
-# SERVIDOR
-# ============================================================
+sudo chown <usuario>:<grupo> <archivo>
+# Cambiar propietario.
 
-async def serve(
-    host: str,
-    port: int,
-    block_active: bool,
-):
+sudo chown -R <usuario>:<grupo> <directorio>
+# Cambiar propietario recursivamente.
 
-    service = AudioOutService(
-        block_active=block_active
-    )
+sudo chmod <permisos> <archivo>
+# Cambiar permisos.
 
-    server = grpc.aio.server()
+sudo chmod -R <permisos> <directorio>
+# Cambiar permisos recursivamente.
 
-    audio_listener_pb2_grpc.add_SegmentOutputServicer_to_server(
-        service,
-        server,
-    )
+sudo usermod -aG <grupo> <usuario>
+# Agregar usuario a grupo.
 
-    address = f"{host}:{port}"
+sudo groupadd <grupo>
+# Crear grupo.
 
-    server.add_insecure_port(address)
+sudo useradd <usuario>
+# Crear usuario.
 
-    await service.start()
+Consultar:
 
-    await server.start()
+id
+# Tu usuario y grupos.
 
-    print(
-        "=============================================="
-    )
+groups
+# Grupos actuales.
 
-    print(
-        "[OUT] Audio OUT iniciado"
-    )
+getent group docker
+# Usuarios pertenecientes a docker.
 
-    print(
-        f"[OUT] Address: {address}"
-    )
+getent passwd
+# Usuarios del sistema.
 
-    print(
-        f"[OUT] block_active: {block_active}"
-    )
 
-    print(
-        f"[OUT] Session timeout: "
-        f"{SESSION_TIMEOUT_SECONDS}s"
-    )
+---
 
-    print(
-        "=============================================="
-    )
+13. Directorios del sistema
 
-    # --------------------------------------------------------
-    # Shutdown limpio
-    # --------------------------------------------------------
+Para instalar cosas:
 
-    stop_event = asyncio.Event()
+sudo mkdir /opt/<proyecto>
+# Crear directorio.
 
-    loop = asyncio.get_running_loop()
+sudo mkdir -p /opt/<proyecto>/models
+# Crear estructura.
 
-    def request_shutdown():
+sudo cp <archivo> /opt/<proyecto>/
+# Copiar.
 
-        print(
-            "\n[OUT] Señal de apagado recibida"
-        )
+sudo mv <archivo> /opt/<proyecto>/
+# Mover.
 
-        stop_event.set()
+sudo rm <archivo>
+# Eliminar.
 
-    for sig in (
-        signal.SIGINT,
-        signal.SIGTERM,
-    ):
+sudo rm -rf <directorio>
+# Eliminar directorio recursivamente.
 
-        try:
+Ten mucho cuidado con:
 
-            loop.add_signal_handler(
-                sig,
-                request_shutdown
-            )
+sudo rm -rf
 
-        except NotImplementedError:
-            pass
+Yo no pediría un permiso sudo indiscriminado para rm si seguridad está intentando restringir privilegios.
 
-    try:
 
-        await stop_event.wait()
+---
 
-    finally:
+14. /opt, /srv, /var
 
-        print(
-            "[OUT] Deteniendo gRPC..."
-        )
+Para servicios propios normalmente pediría acceso a:
 
-        await server.stop(
-            grace=5
-        )
+/opt/
+/srv/
+/var/log/
+/etc/systemd/system/
 
-        await service.stop()
+Por ejemplo:
 
+/opt/voicebot/
+/opt/llm/
+/opt/tts/
+/opt/stt/
+/srv/services/
 
-# ============================================================
-# ARGUMENTOS
-# ============================================================
+Pero idealmente la empresa puede darte propiedad sobre un directorio concreto, por ejemplo:
 
-def parse_args():
+/opt/development/
 
-    parser = argparse.ArgumentParser(
-        description="Audio OUT asynchronous gRPC service"
-    )
+en lugar de permitir modificar cualquier cosa de /opt.
 
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host donde escucha gRPC",
-    )
 
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=9000,
-        help="Puerto gRPC",
-    )
+---
 
-    parser.add_argument(
-        "--block-active",
-        action="store_true",
-        help=(
-            "Ignora nuevas solicitudes de un call_id "
-            "mientras processListen está ejecutándose"
-        ),
-    )
+15. Cron
 
-    return parser.parse_args()
+Para tareas programadas:
 
+crontab -e
+# Editar cron del usuario.
 
-# ============================================================
-# MAIN
-# ============================================================
+crontab -l
+# Ver cron del usuario.
 
-def main():
+sudo crontab -l
+# Ver cron de root.
 
-    args = parse_args()
+sudo crontab -e
+# Editar cron de root.
 
-    try:
+También:
 
-        asyncio.run(
-            serve(
-                host=args.host,
-                port=args.port,
-                block_active=args.block_active,
-            )
-        )
+sudo systemctl status cron
+# Estado del servicio cron.
 
-    except KeyboardInterrupt:
+sudo systemctl restart cron
+# Reiniciar cron.
 
-        pass
+Para tu usuario, normalmente basta con:
 
+crontab -e
+crontab -l
 
-if __name__ == "__main__":
-    main()
+No necesitas sudo para tu propio cron.
+
+
+---
+
+16. systemd timers
+
+Como alternativa moderna a cron:
+
+systemctl list-timers
+# Ver timers.
+
+sudo systemctl list-timers --all
+# Todos los timers.
+
+sudo systemctl start <timer>
+sudo systemctl stop <timer>
+sudo systemctl enable <timer>
+sudo systemctl disable <timer>
+
+
+---
+
+17. Almacenamiento
+
+Esto te va a servir muchísimo con modelos de 5 GB, 10 GB, 20 GB, etc.
+
+df -h
+# Espacio disponible.
+
+df -ih
+# Inodos disponibles.
+
+du -sh <directorio>
+# Tamaño de directorio.
+
+sudo du -sh /var/*
+# Tamaño de /var.
+
+lsblk
+# Discos y particiones.
+
+sudo fdisk -l
+# Información de discos.
+
+sudo blkid
+# UUID/tipos de filesystem.
+
+mount
+# Sistemas montados.
+
+findmnt
+# Sistemas montados.
+
+Para Docker:
+
+docker system df
+# Espacio utilizado por Docker.
+
+docker system df -v
+# Detalle.
+
+
+---
+
+18. Montajes
+
+Si trabajas con discos para modelos:
+
+sudo mount <dispositivo> <directorio>
+# Montar dispositivo.
+
+sudo umount <directorio>
+# Desmontar.
+
+sudo mount -a
+# Montar entradas de /etc/fstab.
+
+Y:
+
+sudo nano /etc/fstab
+
+Pero modificar /etc/fstab debería ser un permiso más restringido.
+
+
+---
+
+19. Compresión y archivos
+
+tar -xvf archivo.tar
+# Extraer tar.
+
+tar -xzf archivo.tar.gz
+# Extraer tar.gz.
+
+sudo tar -xzf archivo.tar.gz -C /opt/
+# Extraer como root.
+
+gzip
+gunzip
+zip
+unzip
+
+
+---
+
+20. SSH
+
+Para conectarte a otros servidores:
+
+ssh usuario@servidor
+# Conectar por SSH.
+
+scp archivo usuario@servidor:/ruta/
+# Copiar archivo.
+
+rsync -av archivo usuario@servidor:/ruta/
+# Sincronizar.
+
+ssh-keygen
+# Crear clave SSH.
+
+Si el equipo debe actuar como servidor:
+
+sudo systemctl status ssh
+sudo systemctl start ssh
+sudo systemctl enable ssh
+
+
+---
+
+21. Variables de entorno y librerías
+
+Para problemas como:
+
+libcudnn.so
+libprotobuf.so
+libgrpc++.so
+libten_vad.so
+
+te interesa:
+
+ldconfig -p
+# Ver librerías conocidas.
+
+sudo ldconfig
+# Actualizar caché.
+
+ldd <ejecutable>
+# Ver dependencias dinámicas.
+
+printenv
+# Variables de entorno.
+
+env
+# Variables de entorno.
+
+Y:
+
+echo $LD_LIBRARY_PATH
+echo $PATH
+echo $CUDA_HOME
+
+
+---
+
+22. CUDA
+
+En tus máquinas GPU:
+
+nvcc --version
+# Versión del compilador CUDA.
+
+nvidia-smi
+# Driver/GPU/CUDA soportada.
+
+which nvcc
+# Ubicación de nvcc.
+
+ls -l /usr/local/cuda
+# CUDA instalada.
+
+ls /usr/local/
+# Versiones CUDA.
+
+Instalación/actualización de CUDA normalmente requiere:
+
+sudo apt install ...
+
+pero yo no pediría permiso libre para cambiar drivers NVIDIA. Eso debería administrarlo IT.
+
+Un cambio incorrecto de driver puede dejarte sin GPU.
+
+
+---
+
+23. Diagnóstico de GPU
+
+sudo nvidia-smi
+sudo nvidia-smi -q
+sudo nvidia-smi dmon
+sudo nvidia-smi pmon
+
+Y:
+
+sudo fuser -v /dev/nvidia*
+# Ver procesos utilizando dispositivos NVIDIA.
+
+Esto es particularmente útil cuando:
+
+CUDA out of memory
+GPU ocupada
+proceso zombie
+servicio que no libera VRAM
+
+
+---
+
+24. Performance CPU
+
+lscpu
+# Información CPU.
+
+free -h
+# RAM.
+
+vmstat
+# Memoria/CPU/IO.
+
+iostat
+# IO.
+
+uptime
+# Carga.
+
+nproc
+# Número de CPUs.
+
+numactl --hardware
+# Topología NUMA.
+
+Puedes instalar:
+
+sudo apt install htop
+sudo apt install sysstat
+sudo apt install numactl
+
+
+---
+
+25. Debugging de procesos
+
+Para tus C++:
+
+gdb <programa>
+# Debugger.
+
+sudo gdb -p <PID>
+# Adjuntar debugger a proceso.
+
+strace <programa>
+# Ver llamadas al sistema.
+
+sudo strace -p <PID>
+# Inspeccionar proceso existente.
+
+ltrace <programa>
+# Ver llamadas a librerías.
+
+Y:
+
+sudo perf
+# Profiling de rendimiento.
+
+Esto puede requerir permisos especiales según la configuración de seguridad del kernel.
+
+
+---
+
+26. Core dumps
+
+Muy útil si un servidor C++ se cae:
+
+ulimit -c
+# Ver configuración de core dumps.
+
+sudo coredumpctl list
+# Core dumps disponibles.
+
+sudo coredumpctl info <PID>
+# Información del crash.
+
+sudo coredumpctl debug <PID>
+# Abrir crash en debugger.
+
+
+---
+
+27. Procesos que ocupan puertos
+
+Esto lo vas a utilizar muchísimo:
+
+sudo ss -ltnp | grep 50051
+
+o:
+
+sudo lsof -i :50051
+
+Después:
+
+sudo kill <PID>
+
+
+---
+
+28. Servicios que no arrancan
+
+Tu checklist sería:
+
+sudo systemctl status mi-servicio
+
+luego:
+
+sudo journalctl -u mi-servicio -n 200
+
+y:
+
+sudo journalctl -u mi-servicio -f
+
+y finalmente:
+
+sudo systemctl cat mi-servicio
+
+Esto cubre una enorme cantidad de problemas.
+
+
+---
+
+29. Variables y secretos
+
+Para servicios que utilizan .env, modelos, certificados, etc.:
+
+sudo ls -la /ruta
+sudo cat /ruta/config
+sudo chown
+sudo chmod
+
+Pero no recomiendo que tu sudoers permita leer indiscriminadamente:
+
+/etc/shadow
+/etc/ssh/*
+/root/*
+
+porque no necesitas eso para desarrollar.
+
+
+---
+
+30. Lo que yo pediría exactamente a IT
+
+En lugar de decir:
+
+> "Necesito sudo completo."
+
+
+
+llevaría algo parecido a esto:
+
+Necesito permisos administrativos para:
+
+1. Gestión de paquetes:
+   apt, apt-get, dpkg
+
+2. Desarrollo:
+   gcc, g++, cmake, make, ninja, ldconfig
+
+3. Python:
+   instalación de python3, python3-dev, python3-venv
+
+4. Docker:
+   configuración y administración de Docker
+   acceso del usuario al grupo docker
+   NVIDIA Container Toolkit
+
+5. GPU:
+   acceso a nvidia-smi y diagnóstico de GPU
+   sin necesidad de modificar drivers NVIDIA salvo autorización de IT
+
+6. systemd:
+   administrar mis servicios de desarrollo
+   systemctl start/stop/restart/status/enable/disable
+   daemon-reload
+   journalctl
+
+7. Logs:
+   lectura de logs de mis servicios
+   journalctl
+   dmesg
+
+8. Red:
+   diagnóstico de puertos/conexiones
+   ss, lsof, ip, etc.
+
+9. Archivos:
+   administración de /opt/<mi-proyecto>
+   /srv/<mi-proyecto>
+   /var/log/<mi-proyecto>
+
+10. Cron:
+    administración de mis tareas programadas.
+
+11. Diagnóstico:
+    gdb, strace, perf, coredumpctl.
+
+12. Almacenamiento:
+    df, du, lsblk, mount cuando sea necesario.
+
+
+---
+
+31. Pero hay una opción mucho mejor: sudoers restringido
+
+Si la empresa no quiere darte sudo total, puedes pedir que IT cree algo como:
+
+/etc/sudoers.d/developer
+
+con permisos específicamente para tus necesidades.
+
+Por ejemplo, conceptualmente:
+
+developer ALL=(root) /usr/bin/systemctl
+developer ALL=(root) /usr/bin/journalctl
+developer ALL=(root) /usr/bin/apt
+developer ALL=(root) /usr/bin/dpkg
+developer ALL=(root) /usr/bin/docker
+developer ALL=(root) /usr/bin/nvidia-smi
+developer ALL=(root) /usr/sbin/ldconfig
+
+Pero ojo: no recomiendo que copies esto directamente a producción. systemctl, apt, docker, etc. pueden permitir escalar privilegios indirectamente si se configuran sin restricciones. Lo correcto es que IT defina comandos, servicios y rutas permitidos.
+
+
+---
+
+32. En tu caso concreto, yo separaría los permisos así
+
+Área	Necesidad
+
+apt install	🔴 Muy importante
+gcc/g++/cmake	🔴 Muy importante
+Python/venv	🔴 Muy importante
+Docker	🔴 Crítico
+NVIDIA Container Toolkit	🔴 Crítico para GPU
+nvidia-smi	🔴 Crítico
+systemctl	🔴 Crítico
+journalctl	🔴 Crítico
+ss/lsof	🔴 Muy importante
+chown/chmod	🔴 Muy importante
+/opt/proyecto	🔴 Muy importante
+/var/log/proyecto	🟠 Importante
+cron	🟠 Importante
+systemd timers	🟠 Importante
+gdb	🟠 Importante
+strace	🟠 Importante
+perf	🟠 Importante
+mount	🟡 Según infraestructura
+firewall	🟡 Según infraestructura
+modificar drivers NVIDIA	🟡 Mejor IT
+/etc/shadow	❌ No necesario
+/root	❌ No necesario
+sudo ALL=(ALL) ALL	❌ Evitar si no es necesario
+
+
+Y algo especialmente importante para ti
+
+Yo intentaría conseguir tres cosas antes que sudo total:
+
+# 1. Docker sin sudo
+sudo usermod -aG docker $USER
+
+# 2. Directorio de desarrollo bajo tu control
+/opt/development/<usuario>/
+
+# 3. Tus propios servicios systemd
+/etc/systemd/system/<tus-servicios>.service
+
+Porque con eso puedes hacer prácticamente todo tu flujo de Python → C++ → CUDA → gRPC → Docker → systemd → logs → monitoreo, sin convertir tu usuario en administrador absoluto.
+
+Si IT te permite sudo total temporalmente para configurar el equipo, también es razonable pedirlo inicialmente y después pasar a un sudoers restringido cuando el entorno ya esté definido.
