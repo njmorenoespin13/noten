@@ -1,712 +1,2492 @@
-sudo nano /etc/gitea/app.ini
+audio_in_manager.py
 
-[security]
-INSTALL_LOCK = true
+import argparse
+import json
+import queue
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
 
-[security]
-INSTALL_LOCK = false
+import grpc
+from pathlib import Path
 
-sudo systemctl restart gitea
-
-http://IP_DEL_SERVIDOR:3000
-
-Crear desde terminal
-sudo -u git /usr/local/bin/gitea admin user create \
-  --config /etc/gitea/app.ini \
-  --username admin \
-  --password 'TU_CLAVE_SEGURA' \
-  --email 'admin@localhost' \
-  --admin
-
-
-Clonado de respositorios
-
-Sí. Pero no copiaría simplemente /var/lib/gitea del servidor viejo. Como queremos conservar compatibilidad con el Git antiguo, primero hay que identificar exactamente qué tenemos y luego migrarlo de forma controlada.
-
-La estrategia que te recomiendo es:
-
-No tocar el servidor viejo.
-Sacar un inventario de repositorios.
-Respaldar repositorios y configuración.
-Crear en el Gitea nuevo los usuarios/organizaciones.
-Migrar cada repositorio conservando:
-historial completo
-todas las ramas
-tags
-commits
-ramas remotas
-hooks si existen y son necesarios
-Git LFS, si lo utilizaban
-Probar clones y push desde un equipo cliente.
-Solo entonces hacer el cambio definitivo.
-Primero necesito saber cómo estaba montado el servidor viejo
-
-En el servidor viejo, ejecuta este bloque:
-
-echo "========== SISTEMA =========="
-cat /etc/os-release
-echo
-
-echo "========== GIT =========="
-git --version
-which git
-echo
-
-echo "========== USUARIO =========="
-whoami
-id
-echo
-
-echo "========== PROCESOS GIT =========="
-ps aux | grep -Ei 'git|gitea|gitlab|gogs' | grep -v grep
-echo
-
-echo "========== SERVICIOS =========="
-systemctl list-units --type=service --all | grep -Ei 'git|gitea|gogs|gitlab'
-echo
-
-echo "========== PUERTOS =========="
-ss -lntp | grep -E ':22 |:80 |:443 |:3000 |:8080 '
-echo
-
-echo "========== DIRECTORIOS =========="
-ls -lah /home
-echo
-ls -lah /var/lib 2>/dev/null | grep -Ei 'git|gitea|gogs|gitlab'
-echo
-
-echo "========== REPOSITORIOS =========="
-find /home /srv /opt /var/lib -type d -name '*.git' 2>/dev/null | head -200
-
-
-No ejecutes todavía ningún mv, rm, git gc ni modificación en el servidor viejo.
-
-Si era un servidor Git "puro"
-
-Si el viejo simplemente tenía repositorios bare, por ejemplo:
-
-/srv/git/proyecto1.git
-/srv/git/proyecto2.git
-/srv/git/proyecto3.git
-
-
-entonces la migración es bastante sencilla. Podemos hacer un git clone --mirror desde el viejo hacia el nuevo:
-
-git clone --mirror usuario@SERVIDOR_VIEJO:/srv/git/proyecto1.git
-
-
-y posteriormente importar ese mirror en Gitea.
-
-Esto conserva el historial y las referencias Git, pero no necesariamente conserva cosas externas a Git, como usuarios, permisos, hooks personalizados o configuración del servidor.
-
-Si el viejo ya era Gitea/Gogs/GitLab
-
-Entonces no hagamos clone --mirror todavía.
-
-En ese caso puede existir una base de datos con:
-
-usuarios
-contraseñas/configuración de cuentas
-organizaciones
-permisos
-repositorios
-issues
-pull requests
-webhooks
-releases
-etc.
-
-Ahí podemos hacer una migración mucho más completa.
-
-Por eso el primer bloque de comandos es importante: quiero identificar qué teníamos antes de decidir el método de migración.
-
-Pásame la salida del bloque del servidor viejo y te preparo el siguiente .sh para hacer la migración al nuevo sin modificar el viejo.
-
-
-
-
-
-
-----------------------
-
-
-#!/usr/bin/env bash
-
-set -euo pipefail
 
 # ============================================================
-# Git Server + Gitea
-# Ubuntu
+# RUTAS DE LOS PROTOBUF GENERADOS
+# ============================================================
+# BASE_DIR = carpeta donde está este archivo Python.
 #
-# Gitea: 1.27.3
-# Git:   2.22.5
+# Ejemplo:
 #
-# IMPORTANTE:
-# - No elimina repositorios existentes.
-# - No reemplaza /usr/bin/git.
-# - Instala Git 2.22.5 en /opt/git-2.22.5
-# - Gitea queda configurado para usar ese Git.
+# /home/neider/Documentos/Proyectos/tenVadProcess/python/
+#     audio_in_manager.py
+#     generated/
+#         audio_listener_pb2.py
+#         audio_listener_pb2_grpc.py
+#
+# Estos archivos son generados a partir del .proto.
 # ============================================================
 
-GITEA_VERSION="1.27.3"
-GIT_VERSION="2.22.5"
+BASE_DIR = Path(__file__).resolve().parent
 
-GITEA_USER="git"
-GITEA_HOME="/home/git"
+GENERATED_DIR = BASE_DIR / "generated"
 
-GITEA_INSTALL="/usr/local/bin/gitea"
-GITEA_DATA="/var/lib/gitea"
-GITEA_CUSTOM="/var/lib/gitea/custom"
-GITEA_REPOS="/var/lib/gitea/git/repositories"
-GITEA_LOG="/var/lib/gitea/log"
-GITEA_CONFIG="/etc/gitea/app.ini"
+# Agregamos generated/ al PYTHONPATH para poder importar
+# los archivos generados por protobuf.
+sys.path.insert(
+    0,
+    str(GENERATED_DIR)
+)
 
-GIT_INSTALL="/opt/git-${GIT_VERSION}"
+import audio_listener_pb2
+import audio_listener_pb2_grpc
 
-GITEA_PORT="3000"
-SSH_PORT="22"
 
-# ------------------------------------------------------------
-# Colores
-# ------------------------------------------------------------
+# ============================================================
+# CONFIGURACIÓN DE AUDIO / UDP
+# ============================================================
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+SAMPLE_RATE = 16000
+CHANNELS = 1
 
-info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+# Tamaño máximo que vamos a aceptar al recibir un datagrama UDP.
+#
+# UDP_BUFFER_SIZE no significa que cada paquete tenga ese tamaño.
+# Simplemente define el máximo que recvfrom() puede recibir.
+UDP_BUFFER_SIZE = 65535
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
-}
+# Variable global utilizada para apagar el proceso
+# correctamente cuando recibimos Ctrl+C (SIGINT) o SIGTERM.
+running = True
 
-# ------------------------------------------------------------
-# Comprobaciones
-# ------------------------------------------------------------
 
-if [[ "${EUID}" -ne 0 ]]; then
-    error "Ejecuta este script como root: sudo bash $0"
-fi
+# ============================================================
+# MANEJO DE SEÑALES
+# ============================================================
 
-if [[ ! -f /etc/os-release ]]; then
-    error "No se pudo determinar la distribución Linux."
-fi
+def signal_handler(
+    signum,
+    frame,
+):
+    """
+    Se ejecuta cuando el proceso recibe:
 
-source /etc/os-release
+        Ctrl+C
+        SIGTERM
 
-if [[ "${ID}" != "ubuntu" ]]; then
-    warn "Este script está pensado para Ubuntu. Detectado: ${PRETTY_NAME}"
-fi
+    En lugar de matar inmediatamente el proceso,
+    cambiamos running=False para que los diferentes
+    componentes puedan cerrarse de forma ordenada.
+    """
 
-ARCH="$(dpkg --print-architecture)"
+    global running
 
-case "${ARCH}" in
-    amd64)
-        GITEA_ARCH="amd64"
-        ;;
-    arm64)
-        GITEA_ARCH="arm64"
-        ;;
-    *)
-        error "Arquitectura no soportada por este script: ${ARCH}"
-        ;;
-esac
+    print(
+        "\n[MANAGER] Shutdown solicitado"
+    )
 
-SERVER_IP="$(hostname -I | awk '{print $1}')"
+    running = False
 
-if [[ -z "${SERVER_IP}" ]]; then
-    SERVER_IP="127.0.0.1"
-fi
 
-info "Servidor detectado: ${SERVER_IP}"
-info "Arquitectura: ${ARCH}"
-info "Gitea: ${GITEA_VERSION}"
-info "Git: ${GIT_VERSION}"
+# ============================================================
+# UDP PACKET
+# ============================================================
+#
+# El headset NO manda directamente gRPC.
+#
+# Primero manda un paquete UDP al único puerto del Manager.
+#
+# Ejemplo:
+#
+# audio_headset.py
+#        |
+#        | UDP :12000
+#        v
+# audio_in_manager.py
+#
+# El paquete UDP tiene esta estructura:
+#
+# +----------------------+-----------------------+----------------+
+# | 4 bytes              | Header JSON           | Audio PCM      |
+# | tamaño del header    |                       |                |
+# +----------------------+-----------------------+----------------+
+#
+# Los primeros 4 bytes indican cuánto mide el JSON.
+#
+# Ejemplo conceptual:
+#
+# [00 00 00 C8] [JSON.....................] [audio...........]
+#
+# Esto permite saber exactamente dónde termina el JSON
+# y dónde comienza el audio.
+# ============================================================
 
-# ------------------------------------------------------------
-# Confirmación
-# ------------------------------------------------------------
+def decode_udp_packet(data):
+    """
+    Decodifica un paquete UDP recibido.
 
-echo
-echo "============================================================"
-echo " INSTALACIÓN DEL SERVIDOR GIT"
-echo "============================================================"
-echo
-echo " Git        : ${GIT_VERSION}"
-echo " Gitea      : ${GITEA_VERSION}"
-echo " Web        : http://${SERVER_IP}:${GITEA_PORT}"
-echo " Repos      : ${GITEA_REPOS}"
-echo
-echo "IMPORTANTE:"
-echo "Este script instalará la infraestructura base."
-echo "NO se importarán todavía los repositorios antiguos."
-echo
-read -rp "¿Continuar? [y/N]: " CONFIRM
+    Devuelve:
 
-if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
-    echo "Cancelado."
-    exit 0
-fi
-
-# ------------------------------------------------------------
-# Paquetes
-# ------------------------------------------------------------
-
-info "Actualizando paquetes..."
-
-apt-get update
-
-apt-get install -y \
-    ca-certificates \
-    curl \
-    wget \
-    xz-utils \
-    tar \
-    gzip \
-    make \
-    gcc \
-    libc6-dev \
-    gettext \
-    zlib1g-dev \
-    libcurl4-openssl-dev \
-    libexpat1-dev \
-    libpcre2-dev \
-    libz-dev \
-    unzip \
-    sqlite3 \
-    openssh-server \
-    git
-
-# ------------------------------------------------------------
-# Usuario git
-# ------------------------------------------------------------
-
-if id "${GITEA_USER}" >/dev/null 2>&1; then
-    info "El usuario ${GITEA_USER} ya existe."
-else
-    info "Creando usuario ${GITEA_USER}..."
-
-    adduser \
-        --system \
-        --shell /bin/bash \
-        --gecos "Git Version Control" \
-        --group \
-        --disabled-password \
-        --home "${GITEA_HOME}" \
-        "${GITEA_USER}"
-fi
-
-# ------------------------------------------------------------
-# Directorios Gitea
-# ------------------------------------------------------------
-
-info "Creando estructura de directorios..."
-
-mkdir -p \
-    "${GITEA_DATA}" \
-    "${GITEA_CUSTOM}" \
-    "${GITEA_REPOS}" \
-    "${GITEA_LOG}" \
-    "${GITEA_DATA}/data"
-
-mkdir -p /etc/gitea
-
-chown -R "${GITEA_USER}:${GITEA_USER}" "${GITEA_DATA}"
-chmod -R 750 "${GITEA_DATA}"
-
-chown root:"${GITEA_USER}" /etc/gitea
-chmod 770 /etc/gitea
-
-# ------------------------------------------------------------
-# Instalar Git 2.22.5
-# ------------------------------------------------------------
-
-if [[ -x "${GIT_INSTALL}/bin/git" ]]; then
-
-    info "Git ${GIT_VERSION} ya está instalado."
-
-else
-
-    info "Instalando Git ${GIT_VERSION}..."
-
-    TMP_DIR="$(mktemp -d)"
-    cd "${TMP_DIR}"
-
-    GIT_TARBALL="git-${GIT_VERSION}.tar.xz"
-    GIT_URL="https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz"
-
-    wget -O "${GIT_TARBALL}" "${GIT_URL}"
-
-    tar -xf "${GIT_TARBALL}"
-
-    cd "git-${GIT_VERSION}"
+        call_id
+        metadata_json
+        audio
+    """
 
     # --------------------------------------------------------
-    # Git 2.22.5 es antiguo.
-    #
-    # Para evitar incompatibilidades con OpenSSL moderno
-    # del Ubuntu actual, el Git usado por Gitea se compila
-    # sin soporte HTTPS propio.
-    #
-    # Gitea maneja HTTP/HTTPS por su cuenta.
-    # Los clientes Git seguirán pudiendo conectarse a Gitea
-    # mediante HTTP/HTTPS/SSH.
+    # Verificamos que al menos existan los 4 bytes del header.
     # --------------------------------------------------------
 
-    info "Compilando Git ${GIT_VERSION}..."
+    if len(data) < 4:
+        raise ValueError(
+            "Paquete UDP demasiado pequeño"
+        )
+
+
+    # --------------------------------------------------------
+    # Leemos los primeros 4 bytes.
+    #
+    # "!I" significa:
+    #
+    # !  -> network byte order (big endian)
+    # I  -> unsigned int de 4 bytes
+    #
+    # Esto nos da el tamaño del JSON.
+    # --------------------------------------------------------
+
+    header_size = struct.unpack(
+        "!I",
+        data[:4],
+    )[0]
+
+
+    # --------------------------------------------------------
+    # Validamos que el tamaño indicado sea correcto.
+    # --------------------------------------------------------
+
+    if (
+        header_size <= 0
+        or
+        len(data) < 4 + header_size
+    ):
+        raise ValueError(
+            "Header UDP inválido"
+        )
+
+
+    # --------------------------------------------------------
+    # Extraemos solamente la parte JSON.
+    #
+    # data[4:] comienza después de los 4 bytes iniciales.
+    # --------------------------------------------------------
+
+    header_bytes = data[
+        4:
+        4 + header_size
+    ]
+
+
+    # --------------------------------------------------------
+    # Todo lo que viene después del JSON es audio.
+    #
+    # En nuestro caso normalmente será PCM:
+    #
+    # 16 kHz
+    # mono
+    # S16_LE
+    # --------------------------------------------------------
+
+    audio = data[
+        4 + header_size:
+    ]
+
+
+    # --------------------------------------------------------
+    # Convertimos el JSON de bytes -> string -> diccionario.
+    # --------------------------------------------------------
+
+    header = json.loads(
+        header_bytes.decode("utf-8")
+    )
+
+
+    # --------------------------------------------------------
+    # Obtenemos el identificador de llamada.
+    #
+    # Este valor es MUY importante porque es el que permite
+    # separar las llamadas.
+    #
+    # Ejemplo:
+    #
+    # call-001
+    # call-002
+    # call-003
+    #
+    # Todas pueden llegar por el mismo UDP :12000.
+    # --------------------------------------------------------
+
+    call_id = header.get(
+        "call_id"
+    )
+
+
+    # --------------------------------------------------------
+    # metadata_json contiene información adicional.
+    #
+    # Por ejemplo:
+    #
+    # cliente_id
+    # campana
+    # agente
+    # etc.
+    #
+    # Si no viene, utilizamos "".
+    # --------------------------------------------------------
+
+    metadata_json = header.get(
+        "metadata_json",
+        "",
+    )
+
+
+    # --------------------------------------------------------
+    # Validaciones básicas.
+    # --------------------------------------------------------
+
+    if not call_id:
+        raise ValueError(
+            "call_id faltante"
+        )
+
+    if not audio:
+        raise ValueError(
+            "audio vacío"
+        )
+
+
+    # --------------------------------------------------------
+    # Devolvemos los tres elementos separados.
+    # --------------------------------------------------------
+
+    return (
+        call_id,
+        metadata_json,
+        audio,
+    )
+
+
+# ============================================================
+# GRPC VAD SESSION
+# ============================================================
+#
+# Esta clase representa UNA llamada conectada a UN TEN VAD.
+#
+# Ejemplo:
+#
+# call-001
+#     |
+#     +--> VAD 127.0.0.1:12001
+#              |
+#              +--> OUT :9001
+#
+#
+# call-002
+#     |
+#     +--> VAD 127.0.0.1:12002
+#              |
+#              +--> OUT :9002
+#
+# Cada sesión tiene:
+#
+# - Su propio queue.Queue()
+# - Su propio canal gRPC
+# - Su propio thread
+# - Su propio call_id
+# - Su propio TEN VAD
+# - Su propio OUT
+#
+# Esto evita que el audio de una llamada se mezcle con otra.
+# ============================================================
+
+class VadSession:
+
+    def __init__(
+        self,
+        call_id,
+        vad_server,
+        out_host,
+        out_port,
+    ):
+
+        # ----------------------------------------------------
+        # Identificador de la llamada.
+        # ----------------------------------------------------
 
-    make configure
+        self.call_id = call_id
+
+
+        # ----------------------------------------------------
+        # Dirección del TEN VAD asignado.
+        #
+        # Ejemplo:
+        #
+        # 127.0.0.1:12001
+        # ----------------------------------------------------
+
+        self.vad_server = vad_server
+
+
+        # ----------------------------------------------------
+        # Dirección del OUT asociado a este TEN VAD.
+        #
+        # Ejemplo:
+        #
+        # host.docker.internal:9001
+        # ----------------------------------------------------
+
+        self.out_host = out_host
+        self.out_port = out_port
+
+
+        # ----------------------------------------------------
+        # Cola exclusiva para esta llamada.
+        #
+        # El UDP Manager mete aquí los audios.
+        #
+        # Otro thread consume estos audios y los manda
+        # mediante gRPC al TEN VAD.
+        #
+        # IMPORTANTE:
+        #
+        # No existe una cola global.
+        #
+        # Cada llamada tiene su propia cola.
+        # ----------------------------------------------------
+
+        self.queue = queue.Queue()
+
+
+        # ----------------------------------------------------
+        # Canal gRPC hacia TEN VAD.
+        # ----------------------------------------------------
+
+        self.channel = None
+
+
+        # Stub que nos permite llamar al servicio TenVad.
+        self.stub = None
+
+
+        # Thread que mantiene la comunicación con TEN VAD.
+        self.thread = None
+
+
+        # Indica si esta sesión continúa activa.
+        self.running = True
+
+
+        # Último momento en que recibimos audio.
+        #
+        # Se utiliza posteriormente para detectar llamadas
+        # que dejaron de enviar audio.
+        self.last_audio = time.monotonic()
+
+
+        # Último metadata recibido.
+        self.metadata_json = ""
+
+
+    # ========================================================
+    # START
+    # ========================================================
+
+    def start(self):
+        """
+        Inicia el thread encargado de conectar con TEN VAD.
+
+        Importante:
+
+        El UDP Server NO se queda esperando a que gRPC
+        conecte.
+
+        La conexión gRPC ocurre en otro thread.
+        """
+
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"vad-{self.call_id}",
+            daemon=True,
+        )
+
+        self.thread.start()
+
+
+    # ========================================================
+    # PUSH AUDIO
+    # ========================================================
+
+    def push_audio(
+        self,
+        audio,
+        metadata_json,
+    ):
+        """
+        Recibe audio desde el UDP Manager y lo mete
+        en la cola de ESTA llamada.
+        """
+
+        # ----------------------------------------------------
+        # Actualizamos el último momento en que recibimos
+        # audio de esta llamada.
+        # ----------------------------------------------------
+
+        self.last_audio = time.monotonic()
+
+
+        # ----------------------------------------------------
+        # El Manager es quien decide a qué OUT debe ir
+        # esta llamada.
+        #
+        # NO confiamos en out_host/out_port enviados por
+        # el headset.
+        # ----------------------------------------------------
+
+        try:
+            metadata = json.loads(
+                metadata_json
+            )
+
+        except Exception:
+            # Si el metadata no es JSON válido,
+            # utilizamos un diccionario vacío.
+            metadata = {}
 
-    ./configure \
-        --prefix="${GIT_INSTALL}" \
-        --without-tcltk
 
-    make -j"$(nproc)"
+        # ----------------------------------------------------
+        # Sobrescribimos el OUT con el OUT que corresponde
+        # al TEN VAD asignado.
+        #
+        # Ejemplo:
+        #
+        # VAD :12001 -> OUT :9001
+        #
+        # VAD :12002 -> OUT :9002
+        # ----------------------------------------------------
+
+        metadata[
+            "out_host"
+        ] = self.out_host
+
+        metadata[
+            "out_port"
+        ] = self.out_port
+
+
+        # ----------------------------------------------------
+        # Convertimos nuevamente el diccionario a JSON.
+        #
+        # separators elimina espacios innecesarios y hace
+        # el mensaje un poco más pequeño.
+        # ----------------------------------------------------
+
+        self.metadata_json = json.dumps(
+            metadata,
+            separators=(",", ":"),
+        )
+
+
+        # ----------------------------------------------------
+        # Guardamos audio + metadata en la cola.
+        #
+        # Este put() normalmente es muy rápido.
+        #
+        # El thread de gRPC será quien saque posteriormente
+        # estos datos de la cola.
+        # ----------------------------------------------------
+
+        self.queue.put(
+            (
+                audio,
+                self.metadata_json,
+            )
+        )
+
 
-    make install
+    # ========================================================
+    # STOP
+    # ========================================================
+
+    def stop(self):
+        """
+        Detiene esta sesión.
+        """
 
-    rm -rf "${TMP_DIR}"
+        # ----------------------------------------------------
+        # Indicamos al generator que debe terminar.
+        # ----------------------------------------------------
 
-fi
+        self.running = False
 
-# ------------------------------------------------------------
-# Comprobar Git
-# ------------------------------------------------------------
 
-if [[ ! -x "${GIT_INSTALL}/bin/git" ]]; then
-    error "No se encontró el Git instalado en ${GIT_INSTALL}/bin/git"
-fi
+        # ----------------------------------------------------
+        # Insertamos None como señal especial.
+        #
+        # El generator detectará None y terminará.
+        # ----------------------------------------------------
 
-INSTALLED_GIT="$("${GIT_INSTALL}/bin/git" --version)"
+        self.queue.put(
+            None
+        )
 
-info "Git instalado: ${INSTALLED_GIT}"
 
-# ------------------------------------------------------------
-# Enlaces Git auxiliares
-# ------------------------------------------------------------
+        # ----------------------------------------------------
+        # Esperamos máximo 5 segundos al thread.
+        # ----------------------------------------------------
+
+        if self.thread:
 
-ln -sf "${GIT_INSTALL}/bin/git" "${GIT_INSTALL}/bin/git-receive-pack"
-ln -sf "${GIT_INSTALL}/bin/git" "${GIT_INSTALL}/bin/git-upload-pack"
-ln -sf "${GIT_INSTALL}/bin/git" "${GIT_INSTALL}/bin/git-upload-archive"
+            self.thread.join(
+                timeout=5
+            )
 
-# ------------------------------------------------------------
-# Instalar Gitea
-# ------------------------------------------------------------
 
-info "Instalando Gitea ${GITEA_VERSION}..."
+        # ----------------------------------------------------
+        # Cerramos el canal gRPC.
+        # ----------------------------------------------------
 
-GITEA_BASE_URL="https://dl.gitea.com/gitea/${GITEA_VERSION}"
+        if self.channel:
+
+            self.channel.close()
 
-TMP_DIR="$(mktemp -d)"
-cd "${TMP_DIR}"
+
+    # ========================================================
+    # GENERATOR gRPC
+    # ========================================================
+    #
+    # gRPC StreamAudio necesita un iterable/generator.
+    #
+    # Este generator convierte:
+    #
+    #     queue.Queue()
+    #
+    # en:
+    #
+    #     AudioStreamRequest
+    #
+    # Por cada audio que entra en la cola se genera
+    # una solicitud protobuf.
+    # ========================================================
+
+    def _generator(self):
+
+        while self.running:
+
+            # ------------------------------------------------
+            # Esperamos hasta que exista audio.
+            # ------------------------------------------------
+
+            item = self.queue.get()
+
+
+            # ------------------------------------------------
+            # None significa:
+            #
+            # "terminar la sesión"
+            # ------------------------------------------------
+
+            if item is None:
+                break
+
+
+            # ------------------------------------------------
+            # Extraemos audio + metadata.
+            # ------------------------------------------------
 
-GITEA_FILE="gitea-${GITEA_VERSION}-linux-${GITEA_ARCH}.xz"
-GITEA_SHA="gitea-${GITEA_VERSION}-linux-${GITEA_ARCH}.xz.sha256"
+            audio, metadata_json = item
+
+
+            # ------------------------------------------------
+            # Construimos el mensaje protobuf.
+            #
+            # Este mensaje viaja por gRPC hacia TEN VAD.
+            # ------------------------------------------------
+
+            yield (
+                audio_listener_pb2.AudioStreamRequest(
+                    call_id=self.call_id,
+                    audio=audio,
+                    metadata_json=metadata_json,
+                )
+            )
 
-wget -O "${GITEA_FILE}" \
-    "${GITEA_BASE_URL}/${GITEA_FILE}"
 
-wget -O "${GITEA_SHA}" \
-    "${GITEA_BASE_URL}/${GITEA_SHA}"
+    # ========================================================
+    # RUN
+    # ========================================================
 
-info "Verificando checksum de Gitea..."
+    def _run(self):
 
-sha256sum -c "${GITEA_SHA}"
+        print(
+            f"[MANAGER] "
+            f"{self.call_id} → "
+            f"VAD {self.vad_server} → "
+            f"OUT {self.out_host}:{self.out_port}"
+        )
 
-unxz "${GITEA_FILE}"
 
-install -m 755 \
-    "${GITEA_FILE%.xz}" \
-    "${GITEA_INSTALL}"
+        try:
+
+            # ------------------------------------------------
+            # Creamos el canal gRPC.
+            #
+            # Ejemplo:
+            #
+            # 127.0.0.1:12001
+            # ------------------------------------------------
 
-rm -rf "${TMP_DIR}"
+            self.channel = grpc.insecure_channel(
+                self.vad_server
+            )
 
-# ------------------------------------------------------------
-# Verificar Gitea
-# ------------------------------------------------------------
 
-"${GITEA_INSTALL}" --version
+            # ------------------------------------------------
+            # Esperamos hasta 10 segundos a que TEN VAD
+            # esté disponible.
+            #
+            # Esto ocurre en ESTE thread, no en el thread
+            # que recibe UDP.
+            # ------------------------------------------------
 
-# ------------------------------------------------------------
-# Permisos
-# ------------------------------------------------------------
+            grpc.channel_ready_future(
+                self.channel
+            ).result(
+                timeout=10
+            )
 
-chown root:root "${GITEA_INSTALL}"
-chmod 755 "${GITEA_INSTALL}"
 
-chown -R "${GITEA_USER}:${GITEA_USER}" "${GITEA_DATA}"
+            # ------------------------------------------------
+            # Creamos el Stub para poder llamar:
+            #
+            # TenVad.StreamAudio()
+            # ------------------------------------------------
 
-chmod 750 "${GITEA_DATA}"
-chmod 770 /etc/gitea
+            self.stub = (
+                audio_listener_pb2_grpc.TenVadStub(
+                    self.channel
+                )
+            )
 
-# ------------------------------------------------------------
-# Configuración Gitea
-# ------------------------------------------------------------
 
-if [[ -f "${GITEA_CONFIG}" ]]; then
+            # ------------------------------------------------
+            # Abrimos el stream bidireccional hacia TEN VAD.
+            #
+            # El generator irá entregando audio conforme
+            # vaya llegando a la cola.
+            # ------------------------------------------------
 
-    warn "Ya existe ${GITEA_CONFIG}"
-    warn "No se sobrescribirá."
+            responses = self.stub.StreamAudio(
+                self._generator()
+            )
+
+
+            # ------------------------------------------------
+            # Esperamos las respuestas de TEN VAD.
+            #
+            # Actualmente TEN VAD responde success=true
+            # mientras la comunicación sea correcta.
+            # ------------------------------------------------
+
+            for response in responses:
+
+                if not response.success:
+
+                    print(
+                        f"[MANAGER] "
+                        f"{self.call_id}: "
+                        f"TEN VAD respondió "
+                        f"success=false",
+                        file=sys.stderr,
+                    )
+
+
+                # ------------------------------------------------
+                # Si la sesión fue detenida, salimos.
+                # ------------------------------------------------
+
+                if not self.running:
+                    break
+
+
+        except grpc.RpcError as exc:
+
+            # ------------------------------------------------
+            # Error específico de gRPC.
+            #
+            # Ejemplo:
+            #
+            # TEN VAD apagado
+            # conexión perdida
+            # servidor no disponible
+            # ------------------------------------------------
+
+            if self.running:
+
+                print(
+                    f"[MANAGER] "
+                    f"{self.call_id} "
+                    f"gRPC ERROR: "
+                    f"{exc.code()} - "
+                    f"{exc.details()}",
+                    file=sys.stderr,
+                )
+
+
+        except Exception as exc:
+
+            # ------------------------------------------------
+            # Cualquier otro error.
+            # ------------------------------------------------
+
+            print(
+                f"[MANAGER] "
+                f"{self.call_id} "
+                f"ERROR: {exc}",
+                file=sys.stderr,
+            )
+
+
+        finally:
+
+            # ------------------------------------------------
+            # Cuando termina la sesión cerramos el canal.
+            # ------------------------------------------------
+
+            if self.channel:
+
+                self.channel.close()
+
+
+            print(
+                f"[MANAGER] "
+                f"{self.call_id} "
+                f"VAD session finalizada"
+            )
+
+
+# ============================================================
+# UDP SERVER
+# ============================================================
+#
+# Esta clase tiene UNA responsabilidad:
+#
+#     Recibir paquetes UDP.
+#
+# NO procesa audio.
+# NO se conecta directamente a TEN VAD.
+#
+# Su trabajo es:
+#
+#     UDP
+#       |
+#       v
+#   decode packet
+#       |
+#       v
+#   AudioManager.receive()
+#
+# ============================================================
 
-else
+class UDPServer:
 
-    info "Generando configuración inicial de Gitea..."
+    def __init__(
+        self,
+        host,
+        port,
+        manager,
+    ):
 
-    cat > "${GITEA_CONFIG}" <<EOF
-APP_NAME = Git Server
-
-[server]
-APP_DATA_PATH = ${GITEA_DATA}/data
-DOMAIN = ${SERVER_IP}
-HTTP_ADDR = 0.0.0.0
-HTTP_PORT = ${GITEA_PORT}
-ROOT_URL = http://${SERVER_IP}:${GITEA_PORT}/
-DISABLE_SSH = false
-SSH_DOMAIN = ${SERVER_IP}
-SSH_PORT = ${SSH_PORT}
-START_SSH_SERVER = false
-LFS_START_SERVER = true
-OFFLINE_MODE = false
-
-[database]
-DB_TYPE = sqlite3
-PATH = ${GITEA_DATA}/data/gitea.db
+        self.host = host
+        self.port = port
+        self.manager = manager
 
-[repository]
-ROOT = ${GITEA_REPOS}
-DEFAULT_BRANCH = main
-DEFAULT_PRIVATE = private
-ENABLE_PUSH_CREATE_USER = true
-ENABLE_PUSH_CREATE_ORG = false
-
-[repository.local]
-LOCAL_COPY_PATH = ${GITEA_DATA}/data/tmp/local-repo
+        self.socket = None
+        self.thread = None
+        self.running = False
 
-[repository.upload]
-TEMP_PATH = ${GITEA_DATA}/data/uploads
 
-[server]
-LANDING_PAGE = home
+    # ========================================================
+    # START UDP
+    # ========================================================
 
-[security]
-INSTALL_LOCK = true
-SECRET_KEY =
+    def start(self):
 
-[service]
-DISABLE_REGISTRATION = true
-REQUIRE_SIGNIN_VIEW = false
-REGISTER_EMAIL_CONFIRM = false
-ENABLE_NOTIFY_MAIL = false
+        # ----------------------------------------------------
+        # Creamos socket UDP IPv4.
+        # ----------------------------------------------------
 
-[mailer]
-ENABLED = false
+        self.socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_DGRAM,
+        )
 
-[log]
-MODE = console
-LEVEL = Info
-ROOT_PATH = ${GITEA_LOG}
 
-[session]
-PROVIDER = file
-PROVIDER_CONFIG = ${GITEA_DATA}/data/sessions
+        # ----------------------------------------------------
+        # Aumentamos el buffer de recepción del sistema.
+        #
+        # Esto ayuda cuando llegan muchos paquetes UDP
+        # rápidamente.
+        #
+        # IMPORTANTE:
+        #
+        # UDP sigue siendo UDP.
+        # No garantiza entrega.
+        # ----------------------------------------------------
 
-[picture]
-AVATAR_UPLOAD_PATH = ${GITEA_DATA}/data/avatars
-REPOSITORY_AVATAR_UPLOAD_PATH = ${GITEA_DATA}/data/repo-avatars
+        self.socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_RCVBUF,
+            16 * 1024 * 1024,
+        )
 
-[attachment]
-PATH = ${GITEA_DATA}/data/attachments
 
-[lfs]
-PATH = ${GITEA_DATA}/data/lfs
+        # ----------------------------------------------------
+        # Escuchamos en:
+        #
+        # 0.0.0.0:12000
+        #
+        # 0.0.0.0 significa todas las interfaces.
+        # ----------------------------------------------------
 
-[git]
-PATH = ${GIT_INSTALL}/bin/git
+        self.socket.bind(
+            (
+                self.host,
+                self.port,
+            )
+        )
 
-[git.timeout]
-DEFAULT = 3600
-MIGRATE = 600
-MIRROR = 300
-CLONE = 300
-PULL = 300
-GC = 60
-EOF
 
-    # Generar SECRET_KEY mediante Gitea
-    info "Generando SECRET_KEY..."
+        self.running = True
 
-    SECRET_KEY="$(
-        sudo -u "${GITEA_USER}" \
-        "${GITEA_INSTALL}" generate secret SECRET_KEY
-    )"
 
-    sed -i \
-        "s|^SECRET_KEY =.*|SECRET_KEY = ${SECRET_KEY}|" \
-        "${GITEA_CONFIG}"
+        # ----------------------------------------------------
+        # El listener UDP corre en un thread independiente.
+        # ----------------------------------------------------
 
-fi
+        self.thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+        )
 
-chown root:"${GITEA_USER}" "${GITEA_CONFIG}"
-chmod 660 "${GITEA_CONFIG}"
+        self.thread.start()
 
-# ------------------------------------------------------------
-# Configuración SSH para Gitea
-# ------------------------------------------------------------
 
-info "Preparando SSH..."
+        print(
+            f"[UDP] Listening on "
+            f"{self.host}:{self.port}"
+        )
 
-mkdir -p "${GITEA_HOME}/.ssh"
 
-touch "${GITEA_HOME}/.ssh/authorized_keys"
+    # ========================================================
+    # STOP UDP
+    # ========================================================
 
-chown -R "${GITEA_USER}:${GITEA_USER}" "${GITEA_HOME}/.ssh"
+    def stop(self):
 
-chmod 700 "${GITEA_HOME}/.ssh"
-chmod 600 "${GITEA_HOME}/.ssh/authorized_keys"
+        self.running = False
 
-# ------------------------------------------------------------
-# Servicio systemd
-# ------------------------------------------------------------
 
-info "Creando servicio systemd..."
+        # ----------------------------------------------------
+        # Cerramos el socket.
+        #
+        # Esto hace que recvfrom() deje de esperar.
+        # ----------------------------------------------------
 
-cat > /etc/systemd/system/gitea.service <<EOF
-[Unit]
-Description=Gitea Git Server
-After=network.target
-After=sshd.service
+        if self.socket:
 
-[Service]
-Type=simple
+            try:
+                self.socket.close()
 
-User=${GITEA_USER}
-Group=${GITEA_USER}
+            except Exception:
+                pass
 
-WorkingDirectory=${GITEA_DATA}
 
-ExecStart=${GITEA_INSTALL} web --config ${GITEA_CONFIG}
+        if self.thread:
 
-Restart=always
-RestartSec=2s
-
-Environment=USER=${GITEA_USER}
-Environment=HOME=${GITEA_HOME}
-Environment=GITEA_WORK_DIR=${GITEA_DATA}
-Environment=PATH=${GIT_INSTALL}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# ------------------------------------------------------------
-# Activar servicio
-# ------------------------------------------------------------
-
-systemctl daemon-reload
-
-systemctl enable gitea
-
-systemctl restart gitea
-
-sleep 5
-
-# ------------------------------------------------------------
-# Comprobar servicio
-# ------------------------------------------------------------
-
-if systemctl is-active --quiet gitea; then
-
-    info "Gitea está ejecutándose correctamente."
-
-else
-
-    echo
-    echo "============================================================"
-    echo " Gitea NO arrancó correctamente"
-    echo "============================================================"
-    echo
-    systemctl status gitea --no-pager
-    echo
-    echo "Logs:"
-    journalctl -u gitea -n 100 --no-pager
-
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Firewall
-# ------------------------------------------------------------
-
-if command -v ufw >/dev/null 2>&1; then
-
-    if ufw status | grep -q "Status: active"; then
-
-        info "Abriendo puerto web ${GITEA_PORT}..."
-
-        ufw allow "${GITEA_PORT}/tcp"
-
-        # SSH ya debería estar abierto normalmente
-        ufw allow "${SSH_PORT}/tcp"
-
-    fi
-fi
-
-# ------------------------------------------------------------
-# Comprobación final
-# ------------------------------------------------------------
-
-echo
-echo "============================================================"
-echo " INSTALACIÓN TERMINADA"
-echo "============================================================"
-echo
-echo "Gitea:"
-echo "  http://${SERVER_IP}:${GITEA_PORT}"
-echo
-echo "Git utilizado por Gitea:"
-echo "  ${GIT_INSTALL}/bin/git"
-echo
-echo "Versión:"
-echo "  $(${GIT_INSTALL}/bin/git --version)"
-echo
-echo "Repositorios:"
-echo "  ${GITEA_REPOS}"
-echo
-echo "Configuración:"
-echo "  ${GITEA_CONFIG}"
-echo
-echo "Servicio:"
-echo "  systemctl status gitea"
-echo
-echo "Logs:"
-echo "  journalctl -u gitea -f"
-echo
-echo "============================================================"
-echo
-echo "SIGUIENTE PASO:"
-echo
-echo "1. Abrir:"
-echo "   http://${SERVER_IP}:${GITEA_PORT}"
-echo
-echo "2. Crear el usuario administrador."
-echo
-echo "3. NO importar todavía los repositorios."
-echo
-echo "4. En la siguiente fase revisaremos el servidor Git antiguo"
-echo "   y prepararemos la migración sin perder ramas, tags,"
-echo "   usuarios, permisos ni historial."
-echo
-echo "============================================================"
+            self.thread.join(
+                timeout=2
+            )
+
+
+    # ========================================================
+    # UDP RECEIVE LOOP
+    # ========================================================
+
+    def _run(self):
+
+        while self.running:
+
+            try:
+
+                # ------------------------------------------------
+                # Esperamos un datagrama UDP.
+                #
+                # data    = contenido
+                # address = IP + puerto del remitente
+                # ------------------------------------------------
+
+                data, address = (
+                    self.socket.recvfrom(
+                        UDP_BUFFER_SIZE
+                    )
+                )
+
+
+            except OSError:
+
+                # ------------------------------------------------
+                # Normalmente ocurre cuando cerramos el socket.
+                # ------------------------------------------------
+
+                break
+
+
+            except Exception as exc:
+
+                print(
+                    f"[UDP] ERROR: {exc}",
+                    file=sys.stderr,
+                )
+
+                continue
+
+
+            try:
+
+                # ------------------------------------------------
+                # Decodificamos el paquete.
+                # ------------------------------------------------
+
+                (
+                    call_id,
+                    metadata_json,
+                    audio,
+                ) = decode_udp_packet(
+                    data
+                )
+
+
+            except Exception as exc:
+
+                # ------------------------------------------------
+                # Si el paquete está corrupto o incompleto,
+                # no afecta al resto de llamadas.
+                # ------------------------------------------------
+
+                print(
+                    f"[UDP] Invalid packet "
+                    f"from {address}: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+
+                continue
+
+
+            # ----------------------------------------------------
+            # Entregamos el audio al AudioManager.
+            #
+            # A partir de aquí AudioManager decide:
+            #
+            # ¿Es una llamada nueva?
+            #
+            # ¿Ya existe?
+            #
+            # ¿Qué TEN VAD le corresponde?
+            # ----------------------------------------------------
+
+            self.manager.receive(
+                call_id=call_id,
+                metadata_json=metadata_json,
+                audio=audio,
+            )
+
+
+# ============================================================
+# AUDIO MANAGER
+# ============================================================
+#
+# ESTA ES LA PARTE MÁS IMPORTANTE.
+#
+# AudioManager administra el POOL de TEN VAD.
+#
+# Tenemos:
+#
+# UDP :12000
+#       |
+#       +---- call-001
+#       +---- call-002
+#       +---- call-003
+#       +---- call-004
+#
+#
+# Y tenemos un pool:
+#
+# VAD 12001 -> OUT 9001
+# VAD 12002 -> OUT 9002
+# VAD 12003 -> OUT 9003
+# ...
+#
+#
+# Cuando aparece una llamada NUEVA:
+#
+# call-001 -> primer VAD disponible
+# call-002 -> segundo VAD disponible
+# call-003 -> tercer VAD disponible
+#
+#
+# Cuando llega otro paquete de call-001:
+#
+# call-001 -> ya existe
+#          -> utiliza EL MISMO VAD
+#
+# ============================================================
+
+class AudioManager:
+
+    def __init__(
+        self,
+        vad_servers,
+        out_host,
+        out_base_port,
+    ):
+
+        # Lista de TEN VAD disponibles.
+        self.vad_servers = vad_servers
+
+
+        # Host donde están los OUT.
+        self.out_host = out_host
+
+
+        # Puerto inicial del OUT.
+        #
+        # Si es 9001:
+        #
+        # VAD #1 -> 9001
+        # VAD #2 -> 9002
+        # VAD #3 -> 9003
+        # --------------------------------------------------------
+
+        self.out_base_port = out_base_port
+
+
+        # --------------------------------------------------------
+        # Lock para proteger las estructuras compartidas.
+        #
+        # Como tenemos múltiples threads, dos llamadas podrían
+        # intentar utilizar el pool al mismo tiempo.
+        #
+        # El lock evita que dos threads asignen accidentalmente
+        # el mismo VAD.
+        # --------------------------------------------------------
+
+        self.lock = threading.Lock()
+
+
+        # --------------------------------------------------------
+        # Diccionario:
+        #
+        # call_id -> VadSession
+        #
+        # Ejemplo:
+        #
+        # {
+        #     "call-001": sesión VAD 12001,
+        #     "call-002": sesión VAD 12002
+        # }
+        # --------------------------------------------------------
+
+        self.sessions = {}
+
+
+        # --------------------------------------------------------
+        # Lista de VAD libres.
+        #
+        # Al iniciar:
+        #
+        # [
+        #   ("127.0.0.1:12001", 9001),
+        #   ("127.0.0.1:12002", 9002),
+        #   ...
+        # ]
+        # --------------------------------------------------------
+
+        self.available = []
+
+
+        # --------------------------------------------------------
+        # Construimos el pool.
+        #
+        # enumerate() nos da:
+        #
+        # index = posición
+        # vad_server = dirección TEN VAD
+        # --------------------------------------------------------
+
+        for index, vad_server in enumerate(
+            vad_servers
+        ):
+
+            # El OUT se calcula según la posición.
+            #
+            # index 0 -> 9001
+            # index 1 -> 9002
+            # index 2 -> 9003
+            out_port = (
+                out_base_port +
+                index
+            )
+
+
+            # Guardamos VAD + OUT como una pareja.
+            self.available.append(
+                (
+                    vad_server,
+                    out_port,
+                )
+            )
+
+
+        # --------------------------------------------------------
+        # Mostramos cuántos TEN VAD tenemos.
+        # --------------------------------------------------------
+
+        print(
+            f"[MANAGER] "
+            f"VAD services disponibles: "
+            f"{len(self.available)}"
+        )
+
+
+        # --------------------------------------------------------
+        # Mostramos el mapeo.
+        #
+        # Ejemplo:
+        #
+        # 127.0.0.1:12001 -> OUT host.docker.internal:9001
+        # 127.0.0.1:12002 -> OUT host.docker.internal:9002
+        # --------------------------------------------------------
+
+        for vad_server, out_port in self.available:
+
+            print(
+                f"[MANAGER] "
+                f"{vad_server} → "
+                f"OUT {out_host}:{out_port}"
+            )
+
+
+    # ========================================================
+    # RECEIVE
+    # ========================================================
+
+    def receive(
+        self,
+        call_id,
+        metadata_json,
+        audio,
+    ):
+
+        # ----------------------------------------------------
+        # Protegemos la asignación del pool.
+        # ----------------------------------------------------
+
+        with self.lock:
+
+            # ------------------------------------------------
+            # Buscamos si esta llamada ya tiene una sesión.
+            # ------------------------------------------------
+
+            session = self.sessions.get(
+                call_id
+            )
+
+
+            # =================================================
+            # CASO 1:
+            # LA LLAMADA ES NUEVA
+            # =================================================
+
+            if session is None:
+
+                # ------------------------------------------------
+                # Si no quedan TEN VAD libres, actualmente
+                # rechazamos el audio.
+                #
+                # Más adelante esto puede cambiarse por una
+                # cola de llamadas pendientes.
+                # ------------------------------------------------
+
+                if not self.available:
+
+                    print(
+                        f"[MANAGER] "
+                        f"NO HAY VAD DISPONIBLE "
+                        f"para {call_id}",
+                        file=sys.stderr,
+                    )
+
+                    return
+
+
+                # ------------------------------------------------
+                # Sacamos el PRIMER VAD disponible.
+                #
+                # pop(0) mantiene el orden:
+                #
+                # primero -> VAD 12001
+                # segundo -> VAD 12002
+                # tercero -> VAD 12003
+                # ------------------------------------------------
+
+                (
+                    vad_server,
+                    out_port,
+                ) = self.available.pop(
+                    0
+                )
+
+
+                print(
+                    f"[MANAGER] ASIGNANDO "
+                    f"{call_id} → "
+                    f"{vad_server} → "
+                    f"OUT {self.out_host}:{out_port}"
+                )
+
+
+                # ------------------------------------------------
+                # Creamos una sesión exclusiva para esta llamada.
+                # ------------------------------------------------
+
+                session = VadSession(
+                    call_id=call_id,
+                    vad_server=vad_server,
+                    out_host=self.out_host,
+                    out_port=out_port,
+                )
+
+
+                # ------------------------------------------------
+                # Guardamos la relación:
+                #
+                # call_id -> sesión
+                #
+                # Desde este momento todos los siguientes
+                # paquetes de call_id utilizarán ESTA sesión.
+                # ------------------------------------------------
+
+                self.sessions[
+                    call_id
+                ] = session
+
+
+                # ------------------------------------------------
+                # Arrancamos el thread gRPC.
+                # ------------------------------------------------
+
+                session.start()
+
+
+            else:
+
+                # =================================================
+                # CASO 2:
+                # LA LLAMADA YA EXISTE
+                # =================================================
+                #
+                # No hacemos absolutamente nada.
+                #
+                # No asignamos otro VAD.
+                #
+                # El paquete continuará utilizando:
+                #
+                # call_id -> session existente
+                #
+                # Esto garantiza que una llamada permanezca
+                # siempre en el mismo TEN VAD.
+                # =================================================
+
+                pass
+
+
+        # --------------------------------------------------------
+        # IMPORTANTE:
+        #
+        # El push se hace FUERA del lock.
+        #
+        # No queremos mantener el lock mientras manipulamos
+        # la cola de audio.
+        # --------------------------------------------------------
+
+        session.push_audio(
+            audio=audio,
+            metadata_json=metadata_json,
+        )
+
+
+    # ========================================================
+    # RELEASE
+    # ========================================================
+
+    def release(
+        self,
+        call_id,
+    ):
+
+        # --------------------------------------------------------
+        # Protegemos el diccionario y pool.
+        # --------------------------------------------------------
+
+        with self.lock:
+
+            # ------------------------------------------------
+            # Sacamos la sesión.
+            # ------------------------------------------------
+
+            session = self.sessions.pop(
+                call_id,
+                None
+            )
+
+
+            # Si no existía, no hacemos nada.
+            if session is None:
+                return
+
+
+            # ------------------------------------------------
+            # El TEN VAD que estaba ocupado vuelve al pool.
+            #
+            # Ejemplo:
+            #
+            # call-001 estaba en VAD 12001
+            #
+            # al liberar:
+            #
+            # VAD 12001 vuelve a available
+            # ------------------------------------------------
+
+            self.available.append(
+                (
+                    session.vad_server,
+                    session.out_port,
+                )
+            )
+
+
+        # --------------------------------------------------------
+        # Detenemos la sesión fuera del lock.
+        #
+        # stop() puede esperar al thread gRPC.
+        # No queremos bloquear el pool durante ese tiempo.
+        # --------------------------------------------------------
+
+        session.stop()
+
+
+        print(
+            f"[MANAGER] Liberado "
+            f"{call_id} → "
+            f"{session.vad_server}"
+        )
+
+
+    # ========================================================
+    # STOP ALL
+    # ========================================================
+
+    def stop_all(self):
+
+        # --------------------------------------------------------
+        # Copiamos las sesiones y limpiamos el diccionario.
+        # --------------------------------------------------------
+
+        with self.lock:
+
+            sessions = list(
+                self.sessions.items()
+            )
+
+            self.sessions.clear()
+
+
+        # --------------------------------------------------------
+        # Detenemos las sesiones una por una.
+        # --------------------------------------------------------
+
+        for call_id, session in sessions:
+
+            print(
+                f"[MANAGER] "
+                f"Stopping {call_id}"
+            )
+
+            session.stop()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "UDP manager with "
+            "TEN VAD pool"
+        )
+    )
+
+
+    # ========================================================
+    # PUERTO UDP ÚNICO
+    # ========================================================
+    #
+    # El headset manda TODAS las llamadas aquí.
+    #
+    # No tenemos un UDP por llamada.
+    #
+    # Ejemplo:
+    #
+    # call-001 ─┐
+    # call-002 ─┤
+    # call-003 ─┼──> UDP :12000
+    # call-004 ─┤
+    # call-005 ─┘
+    #
+    # ========================================================
+
+    parser.add_argument(
+        "--udp-host",
+        default="0.0.0.0",
+    )
+
+    parser.add_argument(
+        "--udp-port",
+        type=int,
+        default=12000,
+    )
+
+
+    # ========================================================
+    # POOL DE TEN VAD
+    # ========================================================
+    #
+    # Lista de servidores separados por coma.
+    #
+    # Cada elemento representa UNA instancia de TEN VAD.
+    #
+    # ========================================================
+
+    parser.add_argument(
+        "--vad-servers",
+        default=(
+            "127.0.0.1:12001,"
+            "127.0.0.1:12002,"
+            "127.0.0.1:12003,"
+            "127.0.0.1:12004,"
+            "127.0.0.1:12005,"
+            "127.0.0.1:12006,"
+            "127.0.0.1:12007,"
+            "127.0.0.1:12008,"
+            "127.0.0.1:12009,"
+            "127.0.0.1:12010,"
+            "127.0.0.1:12011,"
+            "127.0.0.1:12012,"
+            "127.0.0.1:12013,"
+            "127.0.0.1:12014,"
+            "127.0.0.1:12015,"
+            "127.0.0.1:12016,"
+            "127.0.0.1:12017,"
+            "127.0.0.1:12018,"
+            "127.0.0.1:12019,"
+            "127.0.0.1:12020,"
+            "127.0.0.1:12021,"
+            "127.0.0.1:12022,"
+            "127.0.0.1:12023,"
+            "127.0.0.1:12024,"
+            "127.0.0.1:12025,"
+            "127.0.0.1:12026,"
+            "127.0.0.1:12027,"
+            "127.0.0.1:12028,"
+            "127.0.0.1:12029,"
+            "127.0.0.1:12030,"
+            "127.0.0.1:12031,"
+            "127.0.0.1:12032,"
+            "127.0.0.1:12033,"
+            "127.0.0.1:12034,"
+            "127.0.0.1:12035,"
+            "127.0.0.1:12036,"
+            "127.0.0.1:12037,"
+            "127.0.0.1:12038,"
+            "127.0.0.1:12039,"
+            "127.0.0.1:12040,"
+            "127.0.0.1:12041,"
+            "127.0.0.1:12042,"
+            "127.0.0.1:12043,"
+            "127.0.0.1:12044,"
+            "127.0.0.1:12045,"
+            "127.0.0.1:12046,"
+            "127.0.0.1:12047,"
+            "127.0.0.1:12048,"
+            "127.0.0.1:12049,"
+            "127.0.0.1:12050"
+        ),
+        help=(
+            "Lista separada por comas. "
+            "Ej: "
+            "127.0.0.1:12001,"
+            "127.0.0.1:12002,"
+            "127.0.0.1:12003"
+        ),
+    )
+
+
+    # ========================================================
+    # OUT
+    # ========================================================
+
+    parser.add_argument(
+        "--out-host",
+        default="host.docker.internal",
+    )
+
+
+    # --------------------------------------------------------
+    # Puerto inicial.
+    #
+    # Si es 9001:
+    #
+    # VAD 1 -> OUT 9001
+    # VAD 2 -> OUT 9002
+    # ...
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--out-base-port",
+        type=int,
+        default=9001,
+    )
+
+
+    # ========================================================
+    # PARSE ARGUMENTS
+    # ========================================================
+
+    args = parser.parse_args()
+
+
+    # --------------------------------------------------------
+    # Convertimos:
+    #
+    # "127.0.0.1:12001,127.0.0.1:12002"
+    #
+    # en:
+    #
+    # [
+    #     "127.0.0.1:12001",
+    #     "127.0.0.1:12002"
+    # ]
+    # --------------------------------------------------------
+
+    vad_servers = [
+        item.strip()
+        for item in args.vad_servers.split(",")
+        if item.strip()
+    ]
+
+
+    # --------------------------------------------------------
+    # Validamos que exista al menos un TEN VAD.
+    # --------------------------------------------------------
+
+    if not vad_servers:
+
+        print(
+            "[MANAGER] ERROR: "
+            "No hay VAD servers",
+            file=sys.stderr,
+        )
+
+        return 1
+
+
+    # ========================================================
+    # INFORMACIÓN INICIAL
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("        TEN VAD AUDIO MANAGER")
+    print("========================================")
+    print()
+
+
+    print(
+        f"[MANAGER] UDP: "
+        f"{args.udp_host}:{args.udp_port}"
+    )
+
+
+    print(
+        f"[MANAGER] VAD servers: "
+        f"{len(vad_servers)}"
+    )
+
+
+    print(
+        f"[MANAGER] OUT host: "
+        f"{args.out_host}"
+    )
+
+
+    print(
+        f"[MANAGER] OUT base: "
+        f"{args.out_base_port}"
+    )
+
+    print()
+
+
+    # ========================================================
+    # CREAMOS AUDIO MANAGER
+    # ========================================================
+
+    manager = AudioManager(
+        vad_servers=vad_servers,
+        out_host=args.out_host,
+        out_base_port=args.out_base_port,
+    )
+
+
+    # ========================================================
+    # CREAMOS SERVIDOR UDP
+    # ========================================================
+
+    udp_server = UDPServer(
+        host=args.udp_host,
+        port=args.udp_port,
+        manager=manager,
+    )
+
+
+    # ========================================================
+    # EJECUCIÓN PRINCIPAL
+    # ========================================================
+
+    try:
+
+        # Arrancamos el listener UDP.
+        udp_server.start()
+
+
+        # ----------------------------------------------------
+        # main() simplemente mantiene vivo el proceso.
+        #
+        # El trabajo real ocurre en los threads:
+        #
+        # UDP thread
+        # VAD session threads
+        # ----------------------------------------------------
+
+        while running:
+
+            time.sleep(1)
+
+
+    except KeyboardInterrupt:
+
+        pass
+
+
+    finally:
+
+        print(
+            "\n[MANAGER] Stopping..."
+        )
+
+
+        # ----------------------------------------------------
+        # Primero detenemos el UDP.
+        #
+        # Así dejamos de aceptar nuevas llamadas.
+        # ----------------------------------------------------
+
+        udp_server.stop()
+
+
+        # ----------------------------------------------------
+        # Después detenemos todas las sesiones TEN VAD.
+        # ----------------------------------------------------
+
+        manager.stop_all()
+
+
+        print(
+            "[MANAGER] Stopped"
+        )
+
+
+    return 0
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    # --------------------------------------------------------
+    # Registramos Ctrl+C y SIGTERM.
+    # --------------------------------------------------------
+
+    signal.signal(
+        signal.SIGINT,
+        signal_handler,
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        signal_handler,
+    )
+
+
+    # --------------------------------------------------------
+    # Ejecutamos main().
+    # --------------------------------------------------------
+
+    sys.exit(
+        main()
+    )
+
+
+
+
+---------
+
+audio_headset.py
+
+import argparse
+import json
+import signal
+import socket
+import struct
+import sys
+
+import numpy as np
+import sounddevice as sd
+
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+
+FRAME_SAMPLES = 320
+FRAME_MS = 20
+
+running = True
+
+
+def signal_handler(signum, frame):
+
+    global running
+
+    print("\n[HEADSET] Shutdown solicitado")
+
+    running = False
+
+
+def encode_udp_packet(
+    call_id,
+    metadata_json,
+    audio,
+):
+    header = {
+        "call_id": call_id,
+        "metadata_json": metadata_json,
+    }
+
+    header_bytes = json.dumps(
+        header,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return (
+        struct.pack(
+            "!I",
+            len(header_bytes),
+        )
+        + header_bytes
+        + audio
+    )
+
+
+class UDPAudioSender:
+
+    def __init__(
+        self,
+        host,
+        port,
+        copies,
+        call_id_prefix,
+    ):
+
+        self.address = (
+            host,
+            port,
+        )
+
+        self.socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_DGRAM,
+        )
+
+        self.targets = []
+
+        for index in range(copies):
+
+            call_id = (
+                f"{call_id_prefix}-"
+                f"{index + 1:03d}"
+            )
+
+            metadata_json = json.dumps(
+                {
+                    "cliente_id": (
+                        f"12345-{index + 1}"
+                    ),
+                    "campana": "ventas",
+                    "agente": (
+                        f"agente-{index + 1:03d}"
+                    ),
+
+                    # El manager reemplazará
+                    # estos valores con el
+                    # OUT correspondiente.
+                    "out_host": "",
+                    "out_port": 0,
+                },
+                separators=(",", ":"),
+            )
+
+            self.targets.append(
+                (
+                    call_id,
+                    metadata_json,
+                )
+            )
+
+            print(
+                f"[HEADSET] "
+                f"{call_id} -> "
+                f"UDP {host}:{port}"
+            )
+
+    def send(
+        self,
+        audio,
+    ):
+
+        for call_id, metadata_json in self.targets:
+
+            packet = encode_udp_packet(
+                call_id=call_id,
+                metadata_json=metadata_json,
+                audio=audio,
+            )
+
+            try:
+
+                self.socket.sendto(
+                    packet,
+                    self.address,
+                )
+
+            except OSError as exc:
+
+                print(
+                    f"[HEADSET] ERROR "
+                    f"{call_id}: {exc}",
+                    file=sys.stderr,
+                )
+
+    def close(self):
+
+        self.socket.close()
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Captura una diadema y "
+            "simula N llamadas sobre "
+            "un único puerto UDP"
+        )
+    )
+
+    parser.add_argument(
+        "--udp-host",
+        default="127.0.0.1",
+    )
+
+    parser.add_argument(
+        "--udp-port",
+        type=int,
+        default=12000,
+    )
+
+    parser.add_argument(
+        "--copies",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--call-id-prefix",
+        default="call",
+    )
+
+    parser.add_argument(
+        "--device",
+        default=None,
+    )
+
+    args = parser.parse_args()
+
+    if args.copies <= 0:
+
+        print(
+            "[HEADSET] ERROR: "
+            "--copies debe ser mayor que 0",
+            file=sys.stderr,
+        )
+
+        return 1
+
+    print()
+    print("========================================")
+    print("          TEN VAD HEADSET")
+    print("========================================")
+    print()
+
+    print(
+        f"[HEADSET] UDP: "
+        f"{args.udp_host}:{args.udp_port}"
+    )
+
+    print(
+        f"[HEADSET] Copies: "
+        f"{args.copies}"
+    )
+
+    print(
+        f"[HEADSET] Sample rate: "
+        f"{SAMPLE_RATE}"
+    )
+
+    print(
+        f"[HEADSET] Frame: "
+        f"{FRAME_SAMPLES} samples / "
+        f"{FRAME_MS} ms"
+    )
+
+    print()
+
+    sender = UDPAudioSender(
+        host=args.udp_host,
+        port=args.udp_port,
+        copies=args.copies,
+        call_id_prefix=args.call_id_prefix,
+    )
+
+    print()
+    print("[HEADSET] Iniciando captura...")
+
+    try:
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            blocksize=FRAME_SAMPLES,
+            device=args.device,
+        ) as stream:
+
+            print(
+                "[HEADSET] Captura iniciada"
+            )
+
+            print(
+                "[HEADSET] Enviando audio..."
+            )
+
+            print()
+
+            while running:
+
+                audio, overflowed = (
+                    stream.read(
+                        FRAME_SAMPLES
+                    )
+                )
+
+                if overflowed:
+
+                    print(
+                        "[HEADSET] WARNING: "
+                        "input overflow",
+                        file=sys.stderr,
+                    )
+
+                audio_bytes = (
+                    np.asarray(
+                        audio[:, 0],
+                        dtype=np.int16,
+                    ).tobytes()
+                )
+
+                sender.send(
+                    audio_bytes
+                )
+
+    except KeyboardInterrupt:
+
+        pass
+
+    except Exception as exc:
+
+        print(
+            f"[HEADSET] ERROR: {exc}",
+            file=sys.stderr,
+        )
+
+        return 1
+
+    finally:
+
+        sender.close()
+
+        print(
+            "[HEADSET] Detenido"
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+
+    signal.signal(
+        signal.SIGINT,
+        signal_handler,
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        signal_handler,
+    )
+
+    sys.exit(main())
+
+
+
+----------
+
+
+audio_out.py
+
+import argparse
+import signal
+import sys
+import wave
+from concurrent import futures
+from pathlib import Path
+import threading
+
+
+import grpc
+
+
+BASE_DIR = Path(__file__).resolve().parent
+GENERATED_DIR = BASE_DIR / "generated"
+
+sys.path.insert(
+    0,
+    str(GENERATED_DIR)
+)
+
+import audio_listener_pb2
+import audio_listener_pb2_grpc
+
+
+running = True
+
+
+class SegmentOutputService(
+    audio_listener_pb2_grpc.SegmentOutputServicer
+):
+
+    def __init__(
+        self,
+        output_directory,
+    ):
+
+        self.output_directory = Path(
+            output_directory
+        )
+
+        self.output_directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.lock = threading.Lock()
+
+        print(
+            f"[OUT] Audio directory: "
+            f"{self.output_directory}"
+        )
+
+    def SendSegment(
+        self,
+        request,
+        context,
+    ):
+
+        call_id = request.call_id
+        segment_id = request.segment_id
+
+        if not call_id:
+
+            context.set_code(
+                grpc.StatusCode.INVALID_ARGUMENT
+            )
+
+            context.set_details(
+                "call_id es obligatorio"
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        if not request.audio:
+
+            context.set_code(
+                grpc.StatusCode.INVALID_ARGUMENT
+            )
+
+            context.set_details(
+                "audio es obligatorio"
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        sample_rate = (
+            request.sample_rate
+            or 16000
+        )
+
+        channels = (
+            request.channels
+            or 1
+        )
+
+        if sample_rate != 16000:
+
+            context.set_code(
+                grpc.StatusCode.INVALID_ARGUMENT
+            )
+
+            context.set_details(
+                "Solo se acepta audio a 16000 Hz"
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        if channels != 1:
+
+            context.set_code(
+                grpc.StatusCode.INVALID_ARGUMENT
+            )
+
+            context.set_details(
+                "Solo se acepta audio mono"
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        audio_bytes = request.audio
+
+        if len(audio_bytes) % 2 != 0:
+
+            context.set_code(
+                grpc.StatusCode.INVALID_ARGUMENT
+            )
+
+            context.set_details(
+                "Audio PCM16 inválido"
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        duration = (
+            (len(audio_bytes) / 2)
+            / sample_rate
+        )
+
+        call_directory = (
+            self.output_directory /
+            call_id
+        )
+
+        call_directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        output_file = (
+            call_directory /
+            f"{segment_id}.wav"
+        )
+
+        try:
+
+            with self.lock:
+
+                with wave.open(
+                    str(output_file),
+                    "wb",
+                ) as wav:
+
+                    wav.setnchannels(
+                        channels
+                    )
+
+                    wav.setsampwidth(
+                        2
+                    )
+
+                    wav.setframerate(
+                        sample_rate
+                    )
+
+                    wav.writeframes(
+                        audio_bytes
+                    )
+
+        except Exception as exc:
+
+            print(
+                f"[OUT] ERROR guardando "
+                f"{output_file}: {exc}",
+                file=sys.stderr,
+            )
+
+            context.set_code(
+                grpc.StatusCode.INTERNAL
+            )
+
+            context.set_details(
+                "No se pudo guardar WAV"
+            )
+
+            return audio_listener_pb2.SegmentResponse(
+                success=False
+            )
+
+        print(
+            f"[OUT] "
+            f"call={call_id} | "
+            f"segment={segment_id} | "
+            f"{duration:.3f}s | "
+            f"{len(audio_bytes)} bytes | "
+            f"{output_file}"
+        )
+
+        return audio_listener_pb2.SegmentResponse(
+            success=True
+        )
+
+    def Ping(
+        self,
+        request,
+        context,
+    ):
+
+        print(
+            f"[OUT] Ping received | "
+            f"source={request.source}"
+        )
+
+        return audio_listener_pb2.PingResponse(
+            success=True,
+            service="audio-out",
+            message="OUT is alive",
+        )
+
+
+def signal_handler(
+    signum,
+    frame,
+):
+
+    global running
+
+    print(
+        "\n[OUT] Shutdown solicitado"
+    )
+
+    running = False
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "TEN VAD audio output "
+            "WAV recorder"
+        )
+    )
+
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9001,
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="audio_segments",
+        help="Directorio donde guardar WAV",
+    )
+
+    args = parser.parse_args()
+
+    print()
+    print("========================================")
+    print("       TEN VAD AUDIO OUTPUT")
+    print("========================================")
+    print()
+
+    print(
+        f"[OUT] Listening: "
+        f"{args.host}:{args.port}"
+    )
+
+    print(
+        f"[OUT] Output: "
+        f"{args.output_dir}"
+    )
+
+    print(
+        "[OUT] Format: "
+        "WAV / PCM S16_LE / 16000 Hz / mono"
+    )
+
+    print()
+
+    server = grpc.server(
+        futures.ThreadPoolExecutor(
+            max_workers=32
+        )
+    )
+
+    service = SegmentOutputService(
+        output_directory=args.output_dir
+    )
+
+    audio_listener_pb2_grpc.add_SegmentOutputServicer_to_server(
+        service,
+        server,
+    )
+
+    server.add_insecure_port(
+        f"{args.host}:{args.port}"
+    )
+
+    server.start()
+
+    print(
+        f"[OUT] Server started on "
+        f"{args.host}:{args.port}"
+    )
+
+    print(
+        "[OUT] Waiting for segments..."
+    )
+
+    print()
+
+    try:
+
+        while running:
+
+            signal.pause()
+
+    except KeyboardInterrupt:
+
+        pass
+
+    finally:
+
+        print(
+            "[OUT] Stopping server..."
+        )
+
+        server.stop(
+            grace=2
+        ).wait()
+
+        print(
+            "[OUT] Server stopped"
+        )
+
+
+if __name__ == "__main__":
+
+    signal.signal(
+        signal.SIGINT,
+        signal_handler,
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        signal_handler,
+    )
+
+    main()
+
+
+
+
+--------
 
 
 
