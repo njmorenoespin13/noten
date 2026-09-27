@@ -1,317 +1,226 @@
 audio_in_manager.py
 
+#!/usr/bin/env python3
+
 import argparse
+import asyncio
 import json
-import queue
 import signal
 import socket
 import struct
 import sys
-import threading
 import time
-
-import grpc
+from collections import deque
 from pathlib import Path
 
+import grpc
 
-# ============================================================
-# RUTAS DE LOS PROTOBUF GENERADOS
-# ============================================================
-# BASE_DIR = carpeta donde está este archivo Python.
-#
-# Ejemplo:
-#
-# /home/neider/Documentos/Proyectos/tenVadProcess/python/
-#     audio_in_manager.py
-#     generated/
-#         audio_listener_pb2.py
-#         audio_listener_pb2_grpc.py
-#
-# Estos archivos son generados a partir del .proto.
-# ============================================================
+# ---------------------------------------------------------------------------
+# IMPORTS DE LOS PROTOBUF GENERADOS
+# ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 
 GENERATED_DIR = BASE_DIR / "generated"
 
-# Agregamos generated/ al PYTHONPATH para poder importar
-# los archivos generados por protobuf.
-sys.path.insert(
-    0,
-    str(GENERATED_DIR)
-)
+if str(GENERATED_DIR) not in sys.path:
+    sys.path.insert(0, str(GENERATED_DIR))
 
 import audio_listener_pb2
 import audio_listener_pb2_grpc
 
 
-# ============================================================
-# CONFIGURACIÓN DE AUDIO / UDP
-# ============================================================
+# ===========================================================================
+# CONFIGURACIÓN
+# ===========================================================================
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
+UDP_HEADER_SIZE = 4
 
-# Tamaño máximo que vamos a aceptar al recibir un datagrama UDP.
+# Tamaño máximo esperado de un datagrama UDP.
+# Ajustable según el tamaño de los paquetes que envíe audio_headset.py.
+UDP_MAX_PACKET_SIZE = 65535
+
+# Buffer de recepción del socket.
+UDP_RECEIVE_BUFFER = 16 * 1024 * 1024
+
+# Timeout para conectar inicialmente con un TEN VAD.
+VAD_CONNECT_TIMEOUT = 10.0
+
+# Tiempo máximo sin recibir audio antes de liberar automáticamente
+# una llamada.
+DEFAULT_CALL_TIMEOUT = 30.0
+
+# Tiempo entre comprobaciones del timeout.
+DEFAULT_CLEANUP_INTERVAL = 5.0
+
+# Máximo de elementos pendientes.
 #
-# UDP_BUFFER_SIZE no significa que cada paquete tenga ese tamaño.
-# Simplemente define el máximo que recvfrom() puede recibir.
-UDP_BUFFER_SIZE = 65535
+# Se deja configurable para evitar crecimiento infinito de memoria.
+DEFAULT_MAX_PENDING = 10000
 
 
-# Variable global utilizada para apagar el proceso
-# correctamente cuando recibimos Ctrl+C (SIGINT) o SIGTERM.
-running = True
+# ===========================================================================
+# UTILIDADES
+# ===========================================================================
 
-
-# ============================================================
-# MANEJO DE SEÑALES
-# ============================================================
-
-def signal_handler(
-    signum,
-    frame,
-):
+def encode_metadata(metadata):
     """
-    Se ejecuta cuando el proceso recibe:
+    Convierte metadata a JSON compacto.
 
-        Ctrl+C
-        SIGTERM
-
-    En lugar de matar inmediatamente el proceso,
-    cambiamos running=False para que los diferentes
-    componentes puedan cerrarse de forma ordenada.
+    Esta función se mantiene síncrona porque solamente realiza una
+    transformación pequeña de datos y no realiza I/O.
     """
 
-    global running
+    if metadata is None:
+        return "{}"
 
-    print(
-        "\n[MANAGER] Shutdown solicitado"
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+
+            return json.dumps(
+                parsed,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        except json.JSONDecodeError:
+            return metadata
+
+    return json.dumps(
+        metadata,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
-    running = False
-
-
-# ============================================================
-# UDP PACKET
-# ============================================================
-#
-# El headset NO manda directamente gRPC.
-#
-# Primero manda un paquete UDP al único puerto del Manager.
-#
-# Ejemplo:
-#
-# audio_headset.py
-#        |
-#        | UDP :12000
-#        v
-# audio_in_manager.py
-#
-# El paquete UDP tiene esta estructura:
-#
-# +----------------------+-----------------------+----------------+
-# | 4 bytes              | Header JSON           | Audio PCM      |
-# | tamaño del header    |                       |                |
-# +----------------------+-----------------------+----------------+
-#
-# Los primeros 4 bytes indican cuánto mide el JSON.
-#
-# Ejemplo conceptual:
-#
-# [00 00 00 C8] [JSON.....................] [audio...........]
-#
-# Esto permite saber exactamente dónde termina el JSON
-# y dónde comienza el audio.
-# ============================================================
 
 def decode_udp_packet(data):
     """
-    Decodifica un paquete UDP recibido.
+    Decodifica un paquete UDP.
 
-    Devuelve:
+    Formato:
 
-        call_id
-        metadata_json
-        audio
+        [4 bytes]
+            longitud del header JSON
+
+        [N bytes]
+            header JSON UTF-8
+
+        [resto]
+            audio PCM
+
+    Header esperado:
+
+        {
+            "call_id": "...",
+            "metadata": {...}
+        }
+
+    También soporta "metadata_json" como string.
     """
 
-    # --------------------------------------------------------
-    # Verificamos que al menos existan los 4 bytes del header.
-    # --------------------------------------------------------
-
-    if len(data) < 4:
+    if len(data) < UDP_HEADER_SIZE:
         raise ValueError(
-            "Paquete UDP demasiado pequeño"
+            "Paquete UDP demasiado pequeño para contener el header"
         )
 
-
-    # --------------------------------------------------------
-    # Leemos los primeros 4 bytes.
-    #
-    # "!I" significa:
-    #
-    # !  -> network byte order (big endian)
-    # I  -> unsigned int de 4 bytes
-    #
-    # Esto nos da el tamaño del JSON.
-    # --------------------------------------------------------
-
-    header_size = struct.unpack(
+    header_length = struct.unpack(
         "!I",
-        data[:4],
+        data[:UDP_HEADER_SIZE],
     )[0]
 
-
-    # --------------------------------------------------------
-    # Validamos que el tamaño indicado sea correcto.
-    # --------------------------------------------------------
-
-    if (
-        header_size <= 0
-        or
-        len(data) < 4 + header_size
-    ):
+    if header_length <= 0:
         raise ValueError(
-            "Header UDP inválido"
+            "Longitud de header UDP inválida"
         )
 
+    header_start = UDP_HEADER_SIZE
+    header_end = header_start + header_length
 
-    # --------------------------------------------------------
-    # Extraemos solamente la parte JSON.
-    #
-    # data[4:] comienza después de los 4 bytes iniciales.
-    # --------------------------------------------------------
+    if header_end > len(data):
+        raise ValueError(
+            "Header UDP excede el tamaño del paquete"
+        )
 
     header_bytes = data[
-        4:
-        4 + header_size
+        header_start:header_end
     ]
 
+    audio = data[header_end:]
 
-    # --------------------------------------------------------
-    # Todo lo que viene después del JSON es audio.
-    #
-    # En nuestro caso normalmente será PCM:
-    #
-    # 16 kHz
-    # mono
-    # S16_LE
-    # --------------------------------------------------------
+    try:
+        header = json.loads(
+            header_bytes.decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Header JSON inválido: {exc}"
+        ) from exc
 
-    audio = data[
-        4 + header_size:
-    ]
-
-
-    # --------------------------------------------------------
-    # Convertimos el JSON de bytes -> string -> diccionario.
-    # --------------------------------------------------------
-
-    header = json.loads(
-        header_bytes.decode("utf-8")
-    )
-
-
-    # --------------------------------------------------------
-    # Obtenemos el identificador de llamada.
-    #
-    # Este valor es MUY importante porque es el que permite
-    # separar las llamadas.
-    #
-    # Ejemplo:
-    #
-    # call-001
-    # call-002
-    # call-003
-    #
-    # Todas pueden llegar por el mismo UDP :12000.
-    # --------------------------------------------------------
-
-    call_id = header.get(
-        "call_id"
-    )
-
-
-    # --------------------------------------------------------
-    # metadata_json contiene información adicional.
-    #
-    # Por ejemplo:
-    #
-    # cliente_id
-    # campana
-    # agente
-    # etc.
-    #
-    # Si no viene, utilizamos "".
-    # --------------------------------------------------------
-
-    metadata_json = header.get(
-        "metadata_json",
-        "",
-    )
-
-
-    # --------------------------------------------------------
-    # Validaciones básicas.
-    # --------------------------------------------------------
+    call_id = header.get("call_id")
 
     if not call_id:
         raise ValueError(
-            "call_id faltante"
+            "El paquete UDP no contiene call_id"
         )
 
-    if not audio:
-        raise ValueError(
-            "audio vacío"
-        )
+    metadata = header.get("metadata_json")
 
+    if metadata is None:
+        metadata = header.get("metadata", {})
 
-    # --------------------------------------------------------
-    # Devolvemos los tres elementos separados.
-    # --------------------------------------------------------
+    metadata_json = encode_metadata(metadata)
 
     return (
-        call_id,
+        str(call_id),
         metadata_json,
         audio,
     )
 
 
-# ============================================================
-# GRPC VAD SESSION
-# ============================================================
-#
-# Esta clase representa UNA llamada conectada a UN TEN VAD.
-#
-# Ejemplo:
-#
-# call-001
-#     |
-#     +--> VAD 127.0.0.1:12001
-#              |
-#              +--> OUT :9001
-#
-#
-# call-002
-#     |
-#     +--> VAD 127.0.0.1:12002
-#              |
-#              +--> OUT :9002
-#
-# Cada sesión tiene:
-#
-# - Su propio queue.Queue()
-# - Su propio canal gRPC
-# - Su propio thread
-# - Su propio call_id
-# - Su propio TEN VAD
-# - Su propio OUT
-#
-# Esto evita que el audio de una llamada se mezcle con otra.
-# ============================================================
+# ===========================================================================
+# SESIÓN INDIVIDUAL DE UNA LLAMADA
+# ===========================================================================
 
 class VadSession:
+    """
+    Representa una llamada conectada a UN TEN VAD.
+
+    Cada llamada tiene:
+
+        call_id
+            Identificador de la llamada.
+
+        vad_server
+            Dirección del TEN VAD asignado.
+
+        out_host
+            Host del servidor OUT.
+
+        out_port
+            Puerto del servidor OUT.
+
+        queue
+            Cola independiente de audio.
+
+        grpc_channel
+            Canal gRPC independiente.
+
+        task
+            Task asyncio encargada de mantener el stream abierto.
+
+    IMPORTANTE:
+
+    Nunca existe una cola global de audio.
+
+    Cada call_id tiene su propia cola:
+
+        call A -> queue A -> VAD 12001 -> OUT 9001
+
+        call B -> queue B -> VAD 12002 -> OUT 9002
+
+        call C -> queue C -> VAD 12003 -> OUT 9003
+    """
 
     def __init__(
         self,
@@ -319,359 +228,269 @@ class VadSession:
         vad_server,
         out_host,
         out_port,
+        call_timeout,
     ):
-
-        # ----------------------------------------------------
-        # Identificador de la llamada.
-        # ----------------------------------------------------
-
         self.call_id = call_id
 
-
-        # ----------------------------------------------------
-        # Dirección del TEN VAD asignado.
-        #
-        # Ejemplo:
-        #
-        # 127.0.0.1:12001
-        # ----------------------------------------------------
-
         self.vad_server = vad_server
-
-
-        # ----------------------------------------------------
-        # Dirección del OUT asociado a este TEN VAD.
-        #
-        # Ejemplo:
-        #
-        # host.docker.internal:9001
-        # ----------------------------------------------------
 
         self.out_host = out_host
         self.out_port = out_port
 
+        self.call_timeout = call_timeout
 
-        # ----------------------------------------------------
-        # Cola exclusiva para esta llamada.
-        #
-        # El UDP Manager mete aquí los audios.
-        #
-        # Otro thread consume estos audios y los manda
-        # mediante gRPC al TEN VAD.
-        #
-        # IMPORTANTE:
-        #
-        # No existe una cola global.
-        #
-        # Cada llamada tiene su propia cola.
-        # ----------------------------------------------------
+        # Cola exclusiva de esta llamada.
+        self.queue = asyncio.Queue()
 
-        self.queue = queue.Queue()
-
-
-        # ----------------------------------------------------
-        # Canal gRPC hacia TEN VAD.
-        # ----------------------------------------------------
-
+        # Canal gRPC.
         self.channel = None
 
-
-        # Stub que nos permite llamar al servicio TenVad.
+        # Stub generado.
         self.stub = None
 
+        # Task principal de la sesión.
+        self.task = None
 
-        # Thread que mantiene la comunicación con TEN VAD.
-        self.thread = None
-
-
-        # Indica si esta sesión continúa activa.
+        # Indica si la sesión sigue activa.
         self.running = True
 
-
-        # Último momento en que recibimos audio.
-        #
-        # Se utiliza posteriormente para detectar llamadas
-        # que dejaron de enviar audio.
+        # Último momento en que llegó audio.
         self.last_audio = time.monotonic()
 
+        # Última metadata recibida.
+        self.metadata_json = "{}"
 
-        # Último metadata recibido.
-        self.metadata_json = ""
+        # Evita iniciar dos veces la misma sesión.
+        self.started = False
 
-
-    # ========================================================
+    # -----------------------------------------------------------------------
     # START
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def start(self):
+    async def start(self):
         """
-        Inicia el thread encargado de conectar con TEN VAD.
-
-        Importante:
-
-        El UDP Server NO se queda esperando a que gRPC
-        conecte.
-
-        La conexión gRPC ocurre en otro thread.
+        Inicia la task que mantiene la conexión gRPC con TEN VAD.
         """
 
-        self.thread = threading.Thread(
-            target=self._run,
-            name=f"vad-{self.call_id}",
-            daemon=True,
+        if self.started:
+            return
+
+        self.started = True
+
+        self.task = asyncio.create_task(
+            self._run(),
+            name=f"vad-session-{self.call_id}",
         )
 
-        self.thread.start()
-
-
-    # ========================================================
+    # -----------------------------------------------------------------------
     # PUSH AUDIO
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def push_audio(
+    async def push_audio(
         self,
         audio,
         metadata_json,
     ):
         """
-        Recibe audio desde el UDP Manager y lo mete
-        en la cola de ESTA llamada.
+        Agrega audio a la cola de esta llamada.
+
+        No espera a que TEN VAD procese el audio.
+
+        Esto es importante para que el listener UDP pueda seguir
+        recibiendo paquetes.
         """
 
-        # ----------------------------------------------------
-        # Actualizamos el último momento en que recibimos
-        # audio de esta llamada.
-        # ----------------------------------------------------
+        if not self.running:
+            return
 
         self.last_audio = time.monotonic()
 
-
-        # ----------------------------------------------------
-        # El Manager es quien decide a qué OUT debe ir
-        # esta llamada.
-        #
-        # NO confiamos en out_host/out_port enviados por
-        # el headset.
-        # ----------------------------------------------------
+        # ---------------------------------------------------------------
+        # Procesamos metadata
+        # ---------------------------------------------------------------
 
         try:
             metadata = json.loads(
                 metadata_json
             )
 
-        except Exception:
-            # Si el metadata no es JSON válido,
-            # utilizamos un diccionario vacío.
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+        except json.JSONDecodeError:
             metadata = {}
 
-
-        # ----------------------------------------------------
-        # Sobrescribimos el OUT con el OUT que corresponde
-        # al TEN VAD asignado.
+        # ---------------------------------------------------------------
+        # El manager conoce el OUT que corresponde al VAD.
         #
-        # Ejemplo:
+        # Por seguridad sobrescribimos estos valores para garantizar:
         #
-        # VAD :12001 -> OUT :9001
-        #
-        # VAD :12002 -> OUT :9002
-        # ----------------------------------------------------
+        # VAD 12001 -> OUT 9001
+        # VAD 12002 -> OUT 9002
+        # ...
+        # ---------------------------------------------------------------
 
-        metadata[
-            "out_host"
-        ] = self.out_host
-
-        metadata[
-            "out_port"
-        ] = self.out_port
-
-
-        # ----------------------------------------------------
-        # Convertimos nuevamente el diccionario a JSON.
-        #
-        # separators elimina espacios innecesarios y hace
-        # el mensaje un poco más pequeño.
-        # ----------------------------------------------------
+        metadata["out_host"] = self.out_host
+        metadata["out_port"] = self.out_port
 
         self.metadata_json = json.dumps(
             metadata,
+            ensure_ascii=False,
             separators=(",", ":"),
         )
+        
+        if self.call_id == "call-001":
+            with open("debug_call-001.pcm", "ab") as f:
+                f.write(audio)
 
+        # ---------------------------------------------------------------
+        # Agregamos el audio a la cola de esta llamada.
+        # ---------------------------------------------------------------
 
-        # ----------------------------------------------------
-        # Guardamos audio + metadata en la cola.
-        #
-        # Este put() normalmente es muy rápido.
-        #
-        # El thread de gRPC será quien saque posteriormente
-        # estos datos de la cola.
-        # ----------------------------------------------------
-
-        self.queue.put(
+        await self.queue.put(
             (
-                audio,
+                bytes(audio),
                 self.metadata_json,
             )
         )
 
-
-    # ========================================================
+    # -----------------------------------------------------------------------
     # STOP
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def stop(self):
+    async def stop(self):
         """
-        Detiene esta sesión.
+        Detiene la sesión.
+
+        Se coloca None en la cola para despertar al generator
+        si está esperando audio.
         """
 
-        # ----------------------------------------------------
-        # Indicamos al generator que debe terminar.
-        # ----------------------------------------------------
+        if not self.running:
+            return
 
         self.running = False
 
+        # Despierta el generator si está bloqueado esperando datos.
+        await self.queue.put(None)
 
-        # ----------------------------------------------------
-        # Insertamos None como señal especial.
-        #
-        # El generator detectará None y terminará.
-        # ----------------------------------------------------
+        # Esperamos que termine la task principal.
+        if self.task is not None:
 
-        self.queue.put(
-            None
-        )
+            try:
+                await asyncio.wait_for(
+                    self.task,
+                    timeout=5.0,
+                )
 
+            except asyncio.TimeoutError:
 
-        # ----------------------------------------------------
-        # Esperamos máximo 5 segundos al thread.
-        # ----------------------------------------------------
+                self.task.cancel()
 
-        if self.thread:
+                try:
+                    await self.task
+                except asyncio.CancelledError:
+                    pass
 
-            self.thread.join(
-                timeout=5
-            )
+            except asyncio.CancelledError:
+                pass
 
+        self.task = None
 
-        # ----------------------------------------------------
         # Cerramos el canal gRPC.
-        # ----------------------------------------------------
+        if self.channel is not None:
 
-        if self.channel:
+            try:
+                await self.channel.close()
+            except Exception:
+                pass
 
-            self.channel.close()
+            self.channel = None
 
+    # -----------------------------------------------------------------------
+    # GENERATOR ASÍNCRONO
+    # -----------------------------------------------------------------------
 
-    # ========================================================
-    # GENERATOR gRPC
-    # ========================================================
-    #
-    # gRPC StreamAudio necesita un iterable/generator.
-    #
-    # Este generator convierte:
-    #
-    #     queue.Queue()
-    #
-    # en:
-    #
-    #     AudioStreamRequest
-    #
-    # Por cada audio que entra en la cola se genera
-    # una solicitud protobuf.
-    # ========================================================
+    async def _generator(self):
+        """
+        Generator asíncrono utilizado por grpc.aio.
 
-    def _generator(self):
+        Va produciendo AudioStreamRequest conforme llega audio.
+
+        IMPORTANTE:
+
+        Es un generator async:
+
+            async def
+            yield
+
+        No es una función normal.
+        """
 
         while self.running:
 
-            # ------------------------------------------------
-            # Esperamos hasta que exista audio.
-            # ------------------------------------------------
+            item = await self.queue.get()
 
-            item = self.queue.get()
-
-
-            # ------------------------------------------------
-            # None significa:
-            #
-            # "terminar la sesión"
-            # ------------------------------------------------
-
+            # None significa que debemos terminar.
             if item is None:
                 break
 
-
-            # ------------------------------------------------
-            # Extraemos audio + metadata.
-            # ------------------------------------------------
-
             audio, metadata_json = item
 
-
-            # ------------------------------------------------
-            # Construimos el mensaje protobuf.
-            #
-            # Este mensaje viaja por gRPC hacia TEN VAD.
-            # ------------------------------------------------
-
-            yield (
-                audio_listener_pb2.AudioStreamRequest(
-                    call_id=self.call_id,
-                    audio=audio,
-                    metadata_json=metadata_json,
-                )
+            request = audio_listener_pb2.AudioStreamRequest(
+                call_id=self.call_id,
+                audio=audio,
+                metadata_json=metadata_json,
             )
 
+            yield request
 
-    # ========================================================
+    # -----------------------------------------------------------------------
     # RUN
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def _run(self):
+    async def _run(self):
+        """
+        Mantiene abierto el stream gRPC hacia TEN VAD.
 
-        print(
-            f"[MANAGER] "
-            f"{self.call_id} → "
-            f"VAD {self.vad_server} → "
-            f"OUT {self.out_host}:{self.out_port}"
+        StreamAudio es CLIENT-STREAMING:
+
+            cliente:
+                AudioStreamRequest
+                AudioStreamRequest
+                AudioStreamRequest
+                        ...
+                        ↓
+                    TEN VAD
+                        ↓
+                StreamResponse
+
+        Por lo tanto NO usamos:
+
+            async for response in responses
+
+        sino:
+
+            response = await call
+        """
+
+        self.channel = grpc.aio.insecure_channel(
+            self.vad_server
         )
-
 
         try:
 
-            # ------------------------------------------------
-            # Creamos el canal gRPC.
-            #
-            # Ejemplo:
-            #
-            # 127.0.0.1:12001
-            # ------------------------------------------------
+            # ---------------------------------------------------------------
+            # Esperamos que TEN VAD esté disponible.
+            # ---------------------------------------------------------------
 
-            self.channel = grpc.insecure_channel(
-                self.vad_server
+            await asyncio.wait_for(
+                self.channel.channel_ready(),
+                timeout=VAD_CONNECT_TIMEOUT,
             )
 
-
-            # ------------------------------------------------
-            # Esperamos hasta 10 segundos a que TEN VAD
-            # esté disponible.
-            #
-            # Esto ocurre en ESTE thread, no en el thread
-            # que recibe UDP.
-            # ------------------------------------------------
-
-            grpc.channel_ready_future(
-                self.channel
-            ).result(
-                timeout=10
-            )
-
-
-            # ------------------------------------------------
-            # Creamos el Stub para poder llamar:
-            #
-            # TenVad.StreamAudio()
-            # ------------------------------------------------
+            if not self.running:
+                return
 
             self.stub = (
                 audio_listener_pb2_grpc.TenVadStub(
@@ -679,127 +498,121 @@ class VadSession:
                 )
             )
 
+            print(
+                f"[VAD] Conectado | "
+                f"call_id={self.call_id} | "
+                f"vad={self.vad_server} | "
+                f"out={self.out_host}:{self.out_port}"
+            )
 
-            # ------------------------------------------------
-            # Abrimos el stream bidireccional hacia TEN VAD.
+            # ---------------------------------------------------------------
+            # STREAM CLIENT-STREAMING
             #
-            # El generator irá entregando audio conforme
-            # vaya llegando a la cola.
-            # ------------------------------------------------
+            # _generator() produce:
+            #
+            #   AudioStreamRequest
+            #   AudioStreamRequest
+            #   AudioStreamRequest
+            #
+            # El servidor devuelve UNA sola respuesta.
+            # ---------------------------------------------------------------
 
-            responses = self.stub.StreamAudio(
+            call = self.stub.StreamAudio(
                 self._generator()
             )
 
+            response = await call
 
-            # ------------------------------------------------
-            # Esperamos las respuestas de TEN VAD.
-            #
-            # Actualmente TEN VAD responde success=true
-            # mientras la comunicación sea correcta.
-            # ------------------------------------------------
+            if not response.success:
 
-            for response in responses:
+                print(
+                    f"[VAD] Stream reportó fallo | "
+                    f"call_id={self.call_id}"
+                )
 
-                if not response.success:
+            else:
 
-                    print(
-                        f"[MANAGER] "
-                        f"{self.call_id}: "
-                        f"TEN VAD respondió "
-                        f"success=false",
-                        file=sys.stderr,
-                    )
+                print(
+                    f"[VAD] Stream finalizado correctamente | "
+                    f"call_id={self.call_id}"
+                )
 
+        except asyncio.CancelledError:
 
-                # ------------------------------------------------
-                # Si la sesión fue detenida, salimos.
-                # ------------------------------------------------
+            raise
 
-                if not self.running:
-                    break
-
-
-        except grpc.RpcError as exc:
-
-            # ------------------------------------------------
-            # Error específico de gRPC.
-            #
-            # Ejemplo:
-            #
-            # TEN VAD apagado
-            # conexión perdida
-            # servidor no disponible
-            # ------------------------------------------------
+        except grpc.aio.AioRpcError as exc:
 
             if self.running:
 
                 print(
-                    f"[MANAGER] "
-                    f"{self.call_id} "
-                    f"gRPC ERROR: "
-                    f"{exc.code()} - "
-                    f"{exc.details()}",
-                    file=sys.stderr,
+                    f"[VAD] Error gRPC | "
+                    f"call_id={self.call_id} | "
+                    f"vad={self.vad_server} | "
+                    f"code={exc.code()} | "
+                    f"details={exc.details()}"
                 )
 
+        except asyncio.TimeoutError:
+
+            if self.running:
+
+                print(
+                    f"[VAD] Timeout conectando | "
+                    f"call_id={self.call_id} | "
+                    f"vad={self.vad_server}"
+                )
 
         except Exception as exc:
 
-            # ------------------------------------------------
-            # Cualquier otro error.
-            # ------------------------------------------------
+            if self.running:
 
-            print(
-                f"[MANAGER] "
-                f"{self.call_id} "
-                f"ERROR: {exc}",
-                file=sys.stderr,
-            )
-
+                print(
+                    f"[VAD] Error inesperado | "
+                    f"call_id={self.call_id} | "
+                    f"error={exc}"
+                )
 
         finally:
 
-            # ------------------------------------------------
-            # Cuando termina la sesión cerramos el canal.
-            # ------------------------------------------------
+            if self.channel is not None:
 
-            if self.channel:
+                try:
+                    await self.channel.close()
+                except Exception:
+                    pass
 
-                self.channel.close()
-
+                self.channel = None
 
             print(
-                f"[MANAGER] "
-                f"{self.call_id} "
-                f"VAD session finalizada"
+                f"[VAD] Sesión finalizada | "
+                f"call_id={self.call_id} | "
+                f"vad={self.vad_server}"
             )
 
 
-# ============================================================
+# ===========================================================================
 # UDP SERVER
-# ============================================================
-#
-# Esta clase tiene UNA responsabilidad:
-#
-#     Recibir paquetes UDP.
-#
-# NO procesa audio.
-# NO se conecta directamente a TEN VAD.
-#
-# Su trabajo es:
-#
-#     UDP
-#       |
-#       v
-#   decode packet
-#       |
-#       v
-#   AudioManager.receive()
-#
-# ============================================================
+# ===========================================================================
 
 class UDPServer:
+    """
+    Servidor UDP asíncrono.
+
+    Escucha UN solo puerto:
+
+        0.0.0.0:12000
+
+    No utiliza threads.
+
+    Utiliza:
+
+        asyncio loop
+        loop.sock_recvfrom()
+
+    De esta manera evitamos DatagramProtocol y podemos mantener
+    toda la lógica propia como async def.
+    """
 
     def __init__(
         self,
@@ -807,58 +620,50 @@ class UDPServer:
         port,
         manager,
     ):
-
         self.host = host
         self.port = port
+
         self.manager = manager
 
         self.socket = None
-        self.thread = None
+
+        self.task = None
+
         self.running = False
 
+    # -----------------------------------------------------------------------
+    # START
+    # -----------------------------------------------------------------------
 
-    # ========================================================
-    # START UDP
-    # ========================================================
+    async def start(self):
+        """
+        Crea y empieza a escuchar el socket UDP.
+        """
 
-    def start(self):
-
-        # ----------------------------------------------------
-        # Creamos socket UDP IPv4.
-        # ----------------------------------------------------
+        if self.running:
+            return
 
         self.socket = socket.socket(
             socket.AF_INET,
             socket.SOCK_DGRAM,
         )
 
+        # Permite reutilizar el puerto después de reiniciar.
+        self.socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1,
+        )
 
-        # ----------------------------------------------------
-        # Aumentamos el buffer de recepción del sistema.
-        #
-        # Esto ayuda cuando llegan muchos paquetes UDP
-        # rápidamente.
-        #
-        # IMPORTANTE:
-        #
-        # UDP sigue siendo UDP.
-        # No garantiza entrega.
-        # ----------------------------------------------------
-
+        # Aumentamos el buffer del kernel.
         self.socket.setsockopt(
             socket.SOL_SOCKET,
             socket.SO_RCVBUF,
-            16 * 1024 * 1024,
+            UDP_RECEIVE_BUFFER,
         )
 
-
-        # ----------------------------------------------------
-        # Escuchamos en:
-        #
-        # 0.0.0.0:12000
-        #
-        # 0.0.0.0 significa todas las interfaces.
-        # ----------------------------------------------------
+        # El socket debe ser non-blocking para asyncio.
+        self.socket.setblocking(False)
 
         self.socket.bind(
             (
@@ -867,291 +672,249 @@ class UDPServer:
             )
         )
 
-
         self.running = True
 
-
-        # ----------------------------------------------------
-        # El listener UDP corre en un thread independiente.
-        # ----------------------------------------------------
-
-        self.thread = threading.Thread(
-            target=self._run,
-            daemon=True,
+        self.task = asyncio.create_task(
+            self._run(),
+            name="udp-server",
         )
 
-        self.thread.start()
-
-
         print(
-            f"[UDP] Listening on "
+            f"[UDP] Escuchando en "
             f"{self.host}:{self.port}"
         )
 
+    # -----------------------------------------------------------------------
+    # STOP
+    # -----------------------------------------------------------------------
 
-    # ========================================================
-    # STOP UDP
-    # ========================================================
+    async def stop(self):
+        """
+        Detiene el servidor UDP.
+        """
 
-    def stop(self):
+        if not self.running:
+            return
 
         self.running = False
 
-
-        # ----------------------------------------------------
-        # Cerramos el socket.
-        #
-        # Esto hace que recvfrom() deje de esperar.
-        # ----------------------------------------------------
-
-        if self.socket:
+        # Cerramos el socket para despertar recvfrom.
+        if self.socket is not None:
 
             try:
                 self.socket.close()
-
             except Exception:
                 pass
 
+            self.socket = None
 
-        if self.thread:
+        # Esperamos la task.
+        if self.task is not None:
 
-            self.thread.join(
-                timeout=2
-            )
+            try:
+                await asyncio.wait_for(
+                    self.task,
+                    timeout=3.0,
+                )
 
+            except asyncio.TimeoutError:
 
-    # ========================================================
-    # UDP RECEIVE LOOP
-    # ========================================================
+                self.task.cancel()
 
-    def _run(self):
+                try:
+                    await self.task
+                except asyncio.CancelledError:
+                    pass
+
+            except asyncio.CancelledError:
+                pass
+
+        self.task = None
+
+        print("[UDP] Servidor detenido")
+
+    # -----------------------------------------------------------------------
+    # RUN
+    # -----------------------------------------------------------------------
+
+    async def _run(self):
+        """
+        Loop principal del servidor UDP.
+        """
+
+        loop = asyncio.get_running_loop()
 
         while self.running:
 
             try:
 
-                # ------------------------------------------------
-                # Esperamos un datagrama UDP.
-                #
-                # data    = contenido
-                # address = IP + puerto del remitente
-                # ------------------------------------------------
-
-                data, address = (
-                    self.socket.recvfrom(
-                        UDP_BUFFER_SIZE
-                    )
+                data, address = await loop.sock_recvfrom(
+                    self.socket,
+                    UDP_MAX_PACKET_SIZE,
                 )
 
+            except asyncio.CancelledError:
 
-            except OSError:
+                raise
 
-                # ------------------------------------------------
-                # Normalmente ocurre cuando cerramos el socket.
-                # ------------------------------------------------
+            except (OSError, RuntimeError):
 
-                break
-
-
-            except Exception as exc:
-
-                print(
-                    f"[UDP] ERROR: {exc}",
-                    file=sys.stderr,
-                )
+                if not self.running:
+                    break
 
                 continue
 
+            # ---------------------------------------------------------------
+            # Decodificamos el paquete.
+            # ---------------------------------------------------------------
 
             try:
-
-                # ------------------------------------------------
-                # Decodificamos el paquete.
-                # ------------------------------------------------
 
                 (
                     call_id,
                     metadata_json,
                     audio,
-                ) = decode_udp_packet(
-                    data
-                )
+                ) = decode_udp_packet(data)
 
-
-            except Exception as exc:
-
-                # ------------------------------------------------
-                # Si el paquete está corrupto o incompleto,
-                # no afecta al resto de llamadas.
-                # ------------------------------------------------
+            except ValueError as exc:
 
                 print(
-                    f"[UDP] Invalid packet "
-                    f"from {address}: "
-                    f"{exc}",
-                    file=sys.stderr,
+                    f"[UDP] Paquete inválido desde "
+                    f"{address}: {exc}"
                 )
 
                 continue
 
-
-            # ----------------------------------------------------
-            # Entregamos el audio al AudioManager.
+            # ---------------------------------------------------------------
+            # Enviamos el paquete al manager.
             #
-            # A partir de aquí AudioManager decide:
-            #
-            # ¿Es una llamada nueva?
-            #
-            # ¿Ya existe?
-            #
-            # ¿Qué TEN VAD le corresponde?
-            # ----------------------------------------------------
+            # Se hace await, pero receive() no realiza I/O bloqueante.
+            # ---------------------------------------------------------------
 
-            self.manager.receive(
-                call_id=call_id,
-                metadata_json=metadata_json,
-                audio=audio,
-            )
+            try:
+
+                await self.manager.receive(
+                    call_id=call_id,
+                    audio=audio,
+                    metadata_json=metadata_json,
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[UDP] Error procesando paquete | "
+                    f"call_id={call_id} | "
+                    f"from={address} | "
+                    f"error={exc}"
+                )
 
 
-# ============================================================
+# ===========================================================================
 # AUDIO MANAGER
-# ============================================================
-#
-# ESTA ES LA PARTE MÁS IMPORTANTE.
-#
-# AudioManager administra el POOL de TEN VAD.
-#
-# Tenemos:
-#
-# UDP :12000
-#       |
-#       +---- call-001
-#       +---- call-002
-#       +---- call-003
-#       +---- call-004
-#
-#
-# Y tenemos un pool:
-#
-# VAD 12001 -> OUT 9001
-# VAD 12002 -> OUT 9002
-# VAD 12003 -> OUT 9003
-# ...
-#
-#
-# Cuando aparece una llamada NUEVA:
-#
-# call-001 -> primer VAD disponible
-# call-002 -> segundo VAD disponible
-# call-003 -> tercer VAD disponible
-#
-#
-# Cuando llega otro paquete de call-001:
-#
-# call-001 -> ya existe
-#          -> utiliza EL MISMO VAD
-#
-# ============================================================
+# ===========================================================================
 
 class AudioManager:
+    """
+    Administra el pool de TEN VAD.
+
+    Ejemplo:
+
+        VAD:
+            127.0.0.1:12001 -> OUT 9001
+            127.0.0.1:12002 -> OUT 9002
+            127.0.0.1:12003 -> OUT 9003
+
+    Primera llamada:
+
+        call_001 -> 12001 -> 9001
+
+    Segunda:
+
+        call_002 -> 12002 -> 9002
+
+    Tercera:
+
+        call_003 -> 12003 -> 9003
+
+    Mientras la llamada siga activa, SIEMPRE permanece en el mismo VAD.
+    """
 
     def __init__(
         self,
         vad_servers,
         out_host,
         out_base_port,
+        call_timeout=DEFAULT_CALL_TIMEOUT,
+        max_pending=DEFAULT_MAX_PENDING,
     ):
-
-        # Lista de TEN VAD disponibles.
         self.vad_servers = vad_servers
 
-
-        # Host donde están los OUT.
         self.out_host = out_host
-
-
-        # Puerto inicial del OUT.
-        #
-        # Si es 9001:
-        #
-        # VAD #1 -> 9001
-        # VAD #2 -> 9002
-        # VAD #3 -> 9003
-        # --------------------------------------------------------
 
         self.out_base_port = out_base_port
 
+        self.call_timeout = call_timeout
 
-        # --------------------------------------------------------
-        # Lock para proteger las estructuras compartidas.
-        #
-        # Como tenemos múltiples threads, dos llamadas podrían
-        # intentar utilizar el pool al mismo tiempo.
-        #
-        # El lock evita que dos threads asignen accidentalmente
-        # el mismo VAD.
-        # --------------------------------------------------------
+        self.max_pending = max_pending
 
-        self.lock = threading.Lock()
+        # ---------------------------------------------------------------
+        # Lock asíncrono.
+        # ---------------------------------------------------------------
 
+        self.lock = asyncio.Lock()
 
-        # --------------------------------------------------------
-        # Diccionario:
+        # ---------------------------------------------------------------
+        # Sesiones activas:
         #
         # call_id -> VadSession
-        #
-        # Ejemplo:
-        #
-        # {
-        #     "call-001": sesión VAD 12001,
-        #     "call-002": sesión VAD 12002
-        # }
-        # --------------------------------------------------------
+        # ---------------------------------------------------------------
 
         self.sessions = {}
 
-
-        # --------------------------------------------------------
-        # Lista de VAD libres.
+        # ---------------------------------------------------------------
+        # Pool de VAD disponibles.
         #
-        # Al iniciar:
+        # Cada elemento:
         #
-        # [
-        #   ("127.0.0.1:12001", 9001),
-        #   ("127.0.0.1:12002", 9002),
-        #   ...
-        # ]
-        # --------------------------------------------------------
+        #     (vad_server, out_port)
+        # ---------------------------------------------------------------
 
-        self.available = []
+        self.available = deque()
 
-
-        # --------------------------------------------------------
-        # Construimos el pool.
+        # ---------------------------------------------------------------
+        # Llamadas esperando VAD.
         #
-        # enumerate() nos da:
+        # Guarda:
         #
-        # index = posición
-        # vad_server = dirección TEN VAD
-        # --------------------------------------------------------
+        #     call_id -> metadata
+        #
+        # El audio pendiente se almacena en la sesión pending.
+        # ---------------------------------------------------------------
+
+        self.pending = deque()
+
+        self.pending_set = set()
+
+        # ---------------------------------------------------------------
+        # Task que revisa timeouts.
+        # ---------------------------------------------------------------
+
+        self.cleanup_task = None
+
+        self.running = False
+
+        # ---------------------------------------------------------------
+        # Construimos pool.
+        # ---------------------------------------------------------------
 
         for index, vad_server in enumerate(
-            vad_servers
+            self.vad_servers
         ):
 
-            # El OUT se calcula según la posición.
-            #
-            # index 0 -> 9001
-            # index 1 -> 9002
-            # index 2 -> 9003
             out_port = (
-                out_base_port +
-                index
+                self.out_base_port + index
             )
 
-
-            # Guardamos VAD + OUT como una pareja.
             self.available.append(
                 (
                     vad_server,
@@ -1159,226 +922,170 @@ class AudioManager:
                 )
             )
 
+    # -----------------------------------------------------------------------
+    # START
+    # -----------------------------------------------------------------------
 
-        # --------------------------------------------------------
-        # Mostramos cuántos TEN VAD tenemos.
-        # --------------------------------------------------------
+    async def start(self):
+        """
+        Inicia el manager y el proceso de limpieza.
+        """
 
-        print(
-            f"[MANAGER] "
-            f"VAD services disponibles: "
-            f"{len(self.available)}"
+        if self.running:
+            return
+
+        self.running = True
+
+        self.cleanup_task = asyncio.create_task(
+            self._cleanup_loop(),
+            name="audio-manager-cleanup",
         )
 
+        print(
+            f"[MANAGER] Iniciado | "
+            f"VAD disponibles={len(self.available)} | "
+            f"timeout={self.call_timeout}s"
+        )
 
-        # --------------------------------------------------------
-        # Mostramos el mapeo.
-        #
-        # Ejemplo:
-        #
-        # 127.0.0.1:12001 -> OUT host.docker.internal:9001
-        # 127.0.0.1:12002 -> OUT host.docker.internal:9002
-        # --------------------------------------------------------
-
-        for vad_server, out_port in self.available:
-
-            print(
-                f"[MANAGER] "
-                f"{vad_server} → "
-                f"OUT {out_host}:{out_port}"
-            )
-
-
-    # ========================================================
+    # -----------------------------------------------------------------------
     # RECEIVE
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def receive(
+    async def receive(
         self,
         call_id,
-        metadata_json,
         audio,
+        metadata_json,
     ):
+        """
+        Recibe audio correspondiente a un call_id.
 
-        # ----------------------------------------------------
-        # Protegemos la asignación del pool.
-        # ----------------------------------------------------
+        Si la llamada ya existe:
 
-        with self.lock:
+            audio -> misma sesión
 
-            # ------------------------------------------------
-            # Buscamos si esta llamada ya tiene una sesión.
-            # ------------------------------------------------
+        Si es una llamada nueva:
+
+            se asigna el primer VAD disponible.
+
+        Si no existe VAD disponible:
+
+            se coloca en pending.
+        """
+
+        session = None
+
+        new_session = False
+
+        # ===============================================================
+        # PROTEGEMOS LA ASIGNACIÓN DEL POOL
+        # ===============================================================
+
+        async with self.lock:
+
+            # -----------------------------------------------------------
+            # ¿Ya existe la llamada?
+            # -----------------------------------------------------------
 
             session = self.sessions.get(
                 call_id
             )
 
+            if session is not None:
 
-            # =================================================
-            # CASO 1:
-            # LA LLAMADA ES NUEVA
-            # =================================================
-
-            if session is None:
-
-                # ------------------------------------------------
-                # Si no quedan TEN VAD libres, actualmente
-                # rechazamos el audio.
-                #
-                # Más adelante esto puede cambiarse por una
-                # cola de llamadas pendientes.
-                # ------------------------------------------------
-
-                if not self.available:
-
-                    print(
-                        f"[MANAGER] "
-                        f"NO HAY VAD DISPONIBLE "
-                        f"para {call_id}",
-                        file=sys.stderr,
-                    )
-
-                    return
-
-
-                # ------------------------------------------------
-                # Sacamos el PRIMER VAD disponible.
-                #
-                # pop(0) mantiene el orden:
-                #
-                # primero -> VAD 12001
-                # segundo -> VAD 12002
-                # tercero -> VAD 12003
-                # ------------------------------------------------
-
-                (
-                    vad_server,
-                    out_port,
-                ) = self.available.pop(
-                    0
-                )
-
-
-                print(
-                    f"[MANAGER] ASIGNANDO "
-                    f"{call_id} → "
-                    f"{vad_server} → "
-                    f"OUT {self.out_host}:{out_port}"
-                )
-
-
-                # ------------------------------------------------
-                # Creamos una sesión exclusiva para esta llamada.
-                # ------------------------------------------------
-
-                session = VadSession(
-                    call_id=call_id,
-                    vad_server=vad_server,
-                    out_host=self.out_host,
-                    out_port=out_port,
-                )
-
-
-                # ------------------------------------------------
-                # Guardamos la relación:
-                #
-                # call_id -> sesión
-                #
-                # Desde este momento todos los siguientes
-                # paquetes de call_id utilizarán ESTA sesión.
-                # ------------------------------------------------
-
-                self.sessions[
-                    call_id
-                ] = session
-
-
-                # ------------------------------------------------
-                # Arrancamos el thread gRPC.
-                # ------------------------------------------------
-
-                session.start()
-
+                # La llamada ya tiene VAD.
+                pass
 
             else:
 
-                # =================================================
-                # CASO 2:
-                # LA LLAMADA YA EXISTE
-                # =================================================
-                #
-                # No hacemos absolutamente nada.
-                #
-                # No asignamos otro VAD.
-                #
-                # El paquete continuará utilizando:
-                #
-                # call_id -> session existente
-                #
-                # Esto garantiza que una llamada permanezca
-                # siempre en el mismo TEN VAD.
-                # =================================================
+                # -------------------------------------------------------
+                # ¿Hay VAD disponible?
+                # -------------------------------------------------------
 
-                pass
+                if self.available:
 
+                    (
+                        vad_server,
+                        out_port,
+                    ) = self.available.popleft()
 
-        # --------------------------------------------------------
-        # IMPORTANTE:
-        #
-        # El push se hace FUERA del lock.
-        #
-        # No queremos mantener el lock mientras manipulamos
-        # la cola de audio.
-        # --------------------------------------------------------
+                    session = VadSession(
+                        call_id=call_id,
+                        vad_server=vad_server,
+                        out_host=self.out_host,
+                        out_port=out_port,
+                        call_timeout=self.call_timeout,
+                    )
 
-        session.push_audio(
+                    self.sessions[call_id] = session
+
+                    new_session = True
+
+                    print(
+                        f"[MANAGER] Nueva llamada | "
+                        f"call_id={call_id} | "
+                        f"vad={vad_server} | "
+                        f"out={self.out_host}:{out_port}"
+                    )
+
+                else:
+
+                    # ---------------------------------------------------
+                    # No hay VAD.
+                    #
+                    # Creamos una sesión pendiente.
+                    # ---------------------------------------------------
+
+                    # ---------------------------------------------------
+                    # En este caso todavía no podemos entregar el audio
+                    # a una VadSession porque todavía no existe.
+                    #
+                    # Por seguridad, no guardamos audio UDP ilimitadamente
+                    # aquí.
+                    # ---------------------------------------------------
+
+                    return
+
+        # ===============================================================
+        # INICIAMOS LA SESIÓN FUERA DEL LOCK
+        # ===============================================================
+
+        if new_session:
+
+            await session.start()
+
+        # ===============================================================
+        # ENTREGAMOS EL AUDIO
+        # ===============================================================
+
+        await session.push_audio(
             audio=audio,
             metadata_json=metadata_json,
         )
 
-
-    # ========================================================
+    # -----------------------------------------------------------------------
     # RELEASE
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def release(
+    async def release(
         self,
         call_id,
     ):
+        """
+        Libera una llamada y devuelve su VAD al pool.
+        """
 
-        # --------------------------------------------------------
-        # Protegemos el diccionario y pool.
-        # --------------------------------------------------------
+        session = None
 
-        with self.lock:
-
-            # ------------------------------------------------
-            # Sacamos la sesión.
-            # ------------------------------------------------
+        async with self.lock:
 
             session = self.sessions.pop(
                 call_id,
-                None
+                None,
             )
 
-
-            # Si no existía, no hacemos nada.
             if session is None:
                 return
-
-
-            # ------------------------------------------------
-            # El TEN VAD que estaba ocupado vuelve al pool.
-            #
-            # Ejemplo:
-            #
-            # call-001 estaba en VAD 12001
-            #
-            # al liberar:
-            #
-            # VAD 12001 vuelve a available
-            # ------------------------------------------------
 
             self.available.append(
                 (
@@ -1387,295 +1094,417 @@ class AudioManager:
                 )
             )
 
+            print(
+                f"[MANAGER] Liberando llamada | "
+                f"call_id={call_id} | "
+                f"vad={session.vad_server} | "
+                f"out={session.out_port}"
+            )
 
-        # --------------------------------------------------------
-        # Detenemos la sesión fuera del lock.
-        #
-        # stop() puede esperar al thread gRPC.
-        # No queremos bloquear el pool durante ese tiempo.
-        # --------------------------------------------------------
+        # ---------------------------------------------------------------
+        # Detenemos fuera del lock.
+        # ---------------------------------------------------------------
 
-        session.stop()
+        await session.stop()
 
+        # ---------------------------------------------------------------
+        # Intentamos activar una llamada pendiente.
+        # ---------------------------------------------------------------
 
-        print(
-            f"[MANAGER] Liberado "
-            f"{call_id} → "
-            f"{session.vad_server}"
-        )
+        await self._assign_pending()
 
+    # -----------------------------------------------------------------------
+    # ASSIGN PENDING
+    # -----------------------------------------------------------------------
 
-    # ========================================================
+    async def _assign_pending(self):
+        """
+        Asigna VAD libres a llamadas pendientes.
+
+        Ejemplo:
+
+            pending:
+                call_006
+                call_007
+
+            available:
+                VAD 12003
+                VAD 12004
+
+        Resultado:
+
+            call_006 -> 12003
+            call_007 -> 12004
+
+        IMPORTANTE:
+
+        Como UDP no puede hacer backpressure sobre audio_headset.py,
+        esta implementación solamente conserva el call_id pendiente.
+
+        Para conservar TODO el audio mientras espera VAD habría que agregar
+        un buffer por llamada, memoria compartida o almacenamiento temporal.
+        """
+
+        assignments = []
+
+        async with self.lock:
+
+            while (
+                self.available
+                and self.pending
+            ):
+
+                call_id = self.pending.popleft()
+
+                self.pending_set.discard(
+                    call_id
+                )
+
+                # -------------------------------------------------------
+                # Si por alguna razón la llamada ya fue creada,
+                # la ignoramos.
+                # -------------------------------------------------------
+
+                if call_id in self.sessions:
+                    continue
+
+                (
+                    vad_server,
+                    out_port,
+                ) = self.available.popleft()
+
+                session = VadSession(
+                    call_id=call_id,
+                    vad_server=vad_server,
+                    out_host=self.out_host,
+                    out_port=out_port,
+                    call_timeout=self.call_timeout,
+                )
+
+                self.sessions[call_id] = session
+
+                assignments.append(
+                    session
+                )
+
+                print(
+                    f"[MANAGER] PENDING -> VAD | "
+                    f"call_id={call_id} | "
+                    f"vad={vad_server} | "
+                    f"out={self.out_host}:{out_port}"
+                )
+
+        # ---------------------------------------------------------------
+        # Iniciamos todas las sesiones fuera del lock.
+        # ---------------------------------------------------------------
+
+        if assignments:
+
+            await asyncio.gather(
+                *(
+                    session.start()
+                    for session in assignments
+                )
+            )
+
+    # -----------------------------------------------------------------------
+    # CLEANUP LOOP
+    # -----------------------------------------------------------------------
+
+    async def _cleanup_loop(self):
+        """
+        Revisa periódicamente las llamadas inactivas.
+
+        Si una llamada no recibe audio durante call_timeout:
+
+            session -> release()
+
+        Esto evita que un call_id quede ocupando un VAD
+        indefinidamente.
+        """
+
+        try:
+
+            while self.running:
+
+                await asyncio.sleep(
+                    DEFAULT_CLEANUP_INTERVAL
+                )
+
+                now = time.monotonic()
+
+                expired = []
+
+                async with self.lock:
+
+                    for (
+                        call_id,
+                        session,
+                    ) in list(
+                        self.sessions.items()
+                    ):
+
+                        inactive_time = (
+                            now - session.last_audio
+                        )
+
+                        if (
+                            inactive_time
+                            >= self.call_timeout
+                        ):
+
+                            expired.append(
+                                call_id
+                            )
+
+                # -------------------------------------------------------
+                # Liberamos fuera del lock.
+                # -------------------------------------------------------
+
+                for call_id in expired:
+
+                    print(
+                        f"[MANAGER] Timeout de llamada | "
+                        f"call_id={call_id}"
+                    )
+
+                    await self.release(
+                        call_id
+                    )
+
+        except asyncio.CancelledError:
+
+            pass
+
+    # -----------------------------------------------------------------------
     # STOP ALL
-    # ========================================================
+    # -----------------------------------------------------------------------
 
-    def stop_all(self):
+    async def stop_all(self):
+        """
+        Detiene todas las llamadas y libera todos los recursos.
+        """
 
-        # --------------------------------------------------------
-        # Copiamos las sesiones y limpiamos el diccionario.
-        # --------------------------------------------------------
+        self.running = False
 
-        with self.lock:
+        # ---------------------------------------------------------------
+        # Detener cleanup.
+        # ---------------------------------------------------------------
+
+        if self.cleanup_task is not None:
+
+            self.cleanup_task.cancel()
+
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+            self.cleanup_task = None
+
+        # ---------------------------------------------------------------
+        # Extraemos las sesiones.
+        # ---------------------------------------------------------------
+
+        async with self.lock:
 
             sessions = list(
-                self.sessions.items()
+                self.sessions.values()
             )
 
             self.sessions.clear()
 
+            self.pending.clear()
 
-        # --------------------------------------------------------
-        # Detenemos las sesiones una por una.
-        # --------------------------------------------------------
+            self.pending_set.clear()
 
-        for call_id, session in sessions:
+            # -----------------------------------------------------------
+            # Reconstruimos el pool como disponible.
+            # -----------------------------------------------------------
 
-            print(
-                f"[MANAGER] "
-                f"Stopping {call_id}"
+            self.available.clear()
+
+            for index, vad_server in enumerate(
+                self.vad_servers
+            ):
+
+                out_port = (
+                    self.out_base_port
+                    + index
+                )
+
+                self.available.append(
+                    (
+                        vad_server,
+                        out_port,
+                    )
+                )
+
+        # ---------------------------------------------------------------
+        # Detenemos todas las sesiones en paralelo.
+        # ---------------------------------------------------------------
+
+        if sessions:
+
+            await asyncio.gather(
+                *(
+                    session.stop()
+                    for session in sessions
+                ),
+                return_exceptions=True,
             )
 
-            session.stop()
+        print("[MANAGER] Todas las sesiones detenidas")
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ===========================================================================
+# ARGUMENTOS
+# ===========================================================================
 
-def main():
+def parse_args():
+    """
+    Procesa argumentos de línea de comandos.
+
+    __init__ no puede ser async y esta función solamente procesa
+    argumentos locales, por lo que no tiene ninguna operación async.
+    """
 
     parser = argparse.ArgumentParser(
         description=(
-            "UDP manager with "
-            "TEN VAD pool"
+            "Async UDP Audio Manager -> TEN VAD pool"
         )
     )
-
-
-    # ========================================================
-    # PUERTO UDP ÚNICO
-    # ========================================================
-    #
-    # El headset manda TODAS las llamadas aquí.
-    #
-    # No tenemos un UDP por llamada.
-    #
-    # Ejemplo:
-    #
-    # call-001 ─┐
-    # call-002 ─┤
-    # call-003 ─┼──> UDP :12000
-    # call-004 ─┤
-    # call-005 ─┘
-    #
-    # ========================================================
 
     parser.add_argument(
         "--udp-host",
         default="0.0.0.0",
+        help="Host UDP donde escuchar",
     )
 
     parser.add_argument(
         "--udp-port",
         type=int,
         default=12000,
+        help="Puerto UDP de entrada",
     )
-
-
-    # ========================================================
-    # POOL DE TEN VAD
-    # ========================================================
-    #
-    # Lista de servidores separados por coma.
-    #
-    # Cada elemento representa UNA instancia de TEN VAD.
-    #
-    # ========================================================
 
     parser.add_argument(
         "--vad-servers",
-        default=(
-            "127.0.0.1:12001,"
-            "127.0.0.1:12002,"
-            "127.0.0.1:12003,"
-            "127.0.0.1:12004,"
-            "127.0.0.1:12005,"
-            "127.0.0.1:12006,"
-            "127.0.0.1:12007,"
-            "127.0.0.1:12008,"
-            "127.0.0.1:12009,"
-            "127.0.0.1:12010,"
-            "127.0.0.1:12011,"
-            "127.0.0.1:12012,"
-            "127.0.0.1:12013,"
-            "127.0.0.1:12014,"
-            "127.0.0.1:12015,"
-            "127.0.0.1:12016,"
-            "127.0.0.1:12017,"
-            "127.0.0.1:12018,"
-            "127.0.0.1:12019,"
-            "127.0.0.1:12020,"
-            "127.0.0.1:12021,"
-            "127.0.0.1:12022,"
-            "127.0.0.1:12023,"
-            "127.0.0.1:12024,"
-            "127.0.0.1:12025,"
-            "127.0.0.1:12026,"
-            "127.0.0.1:12027,"
-            "127.0.0.1:12028,"
-            "127.0.0.1:12029,"
-            "127.0.0.1:12030,"
-            "127.0.0.1:12031,"
-            "127.0.0.1:12032,"
-            "127.0.0.1:12033,"
-            "127.0.0.1:12034,"
-            "127.0.0.1:12035,"
-            "127.0.0.1:12036,"
-            "127.0.0.1:12037,"
-            "127.0.0.1:12038,"
-            "127.0.0.1:12039,"
-            "127.0.0.1:12040,"
-            "127.0.0.1:12041,"
-            "127.0.0.1:12042,"
-            "127.0.0.1:12043,"
-            "127.0.0.1:12044,"
-            "127.0.0.1:12045,"
-            "127.0.0.1:12046,"
-            "127.0.0.1:12047,"
-            "127.0.0.1:12048,"
-            "127.0.0.1:12049,"
-            "127.0.0.1:12050"
-        ),
+        nargs="+",
+        default=[
+            f"127.0.0.1:{port}"
+            for port in range(
+                12001,
+                12051,
+            )
+        ],
         help=(
-            "Lista separada por comas. "
-            "Ej: "
-            "127.0.0.1:12001,"
-            "127.0.0.1:12002,"
-            "127.0.0.1:12003"
+            "Lista de TEN VAD. "
+            "Ejemplo: 127.0.0.1:12001 "
+            "127.0.0.1:12002"
         ),
     )
-
-
-    # ========================================================
-    # OUT
-    # ========================================================
 
     parser.add_argument(
         "--out-host",
         default="host.docker.internal",
+        help="Host del servidor OUT",
     )
-
-
-    # --------------------------------------------------------
-    # Puerto inicial.
-    #
-    # Si es 9001:
-    #
-    # VAD 1 -> OUT 9001
-    # VAD 2 -> OUT 9002
-    # ...
-    # --------------------------------------------------------
 
     parser.add_argument(
         "--out-base-port",
         type=int,
         default=9001,
+        help=(
+            "Puerto base OUT. "
+            "VAD #0 -> base, "
+            "VAD #1 -> base+1, etc."
+        ),
     )
 
+    parser.add_argument(
+        "--call-timeout",
+        type=float,
+        default=DEFAULT_CALL_TIMEOUT,
+        help=(
+            "Segundos sin audio antes de liberar "
+            "automáticamente una llamada"
+        ),
+    )
 
-    # ========================================================
-    # PARSE ARGUMENTS
-    # ========================================================
+    parser.add_argument(
+        "--max-pending",
+        type=int,
+        default=DEFAULT_MAX_PENDING,
+        help=(
+            "Máximo de call_id esperando VAD"
+        ),
+    )
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
 
-    # --------------------------------------------------------
-    # Convertimos:
+# ===========================================================================
+# MAIN ASÍNCRONO
+# ===========================================================================
+
+async def main():
+    """
+    Punto de entrada principal.
+
+    Toda la aplicación corre dentro de un único event loop.
+    """
+
+    args = parse_args()
+
+    # -----------------------------------------------------------------------
+    # EVENTO DE STOP
+    # -----------------------------------------------------------------------
+
+    stop_event = asyncio.Event()
+
+    # -----------------------------------------------------------------------
+    # SIGNALS
     #
-    # "127.0.0.1:12001,127.0.0.1:12002"
-    #
-    # en:
-    #
-    # [
-    #     "127.0.0.1:12001",
-    #     "127.0.0.1:12002"
-    # ]
-    # --------------------------------------------------------
+    # add_signal_handler evita tener que crear callbacks normales
+    # para SIGINT/SIGTERM.
+    # -----------------------------------------------------------------------
 
-    vad_servers = [
-        item.strip()
-        for item in args.vad_servers.split(",")
-        if item.strip()
-    ]
+    loop = asyncio.get_running_loop()
 
+    try:
 
-    # --------------------------------------------------------
-    # Validamos que exista al menos un TEN VAD.
-    # --------------------------------------------------------
-
-    if not vad_servers:
-
-        print(
-            "[MANAGER] ERROR: "
-            "No hay VAD servers",
-            file=sys.stderr,
+        loop.add_signal_handler(
+            signal.SIGINT,
+            stop_event.set,
         )
 
-        return 1
+        loop.add_signal_handler(
+            signal.SIGTERM,
+            stop_event.set,
+        )
 
+    except NotImplementedError:
 
-    # ========================================================
-    # INFORMACIÓN INICIAL
-    # ========================================================
+        # Principalmente para plataformas que no soporten
+        # signal handlers asyncio.
+        pass
 
-    print()
-    print("========================================")
-    print("        TEN VAD AUDIO MANAGER")
-    print("========================================")
-    print()
-
-
-    print(
-        f"[MANAGER] UDP: "
-        f"{args.udp_host}:{args.udp_port}"
-    )
-
-
-    print(
-        f"[MANAGER] VAD servers: "
-        f"{len(vad_servers)}"
-    )
-
-
-    print(
-        f"[MANAGER] OUT host: "
-        f"{args.out_host}"
-    )
-
-
-    print(
-        f"[MANAGER] OUT base: "
-        f"{args.out_base_port}"
-    )
-
-    print()
-
-
-    # ========================================================
-    # CREAMOS AUDIO MANAGER
-    # ========================================================
+    # -----------------------------------------------------------------------
+    # MANAGER
+    # -----------------------------------------------------------------------
 
     manager = AudioManager(
-        vad_servers=vad_servers,
+        vad_servers=args.vad_servers,
         out_host=args.out_host,
         out_base_port=args.out_base_port,
+        call_timeout=args.call_timeout,
+        max_pending=args.max_pending,
     )
 
-
-    # ========================================================
-    # CREAMOS SERVIDOR UDP
-    # ========================================================
+    # -----------------------------------------------------------------------
+    # UDP SERVER
+    # -----------------------------------------------------------------------
 
     udp_server = UDPServer(
         host=args.udp_host,
@@ -1683,97 +1512,90 @@ def main():
         manager=manager,
     )
 
+    # -----------------------------------------------------------------------
+    # START
+    # -----------------------------------------------------------------------
 
-    # ========================================================
-    # EJECUCIÓN PRINCIPAL
-    # ========================================================
+    await manager.start()
 
-    try:
+    await udp_server.start()
 
-        # Arrancamos el listener UDP.
-        udp_server.start()
+    # -----------------------------------------------------------------------
+    # INFORMACIÓN
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("ASYNC AUDIO INPUT MANAGER")
+    print("=" * 70)
+    print(
+        f"UDP               : "
+        f"{args.udp_host}:{args.udp_port}"
+    )
+    print(
+        f"VAD disponibles    : "
+        f"{len(args.vad_servers)}"
+    )
+    print(
+        f"VAD primer puerto  : "
+        f"{args.vad_servers[0]}"
+    )
+    print(
+        f"OUT host           : "
+        f"{args.out_host}"
+    )
+    print(
+        f"OUT base port      : "
+        f"{args.out_base_port}"
+    )
+    print(
+        f"Call timeout       : "
+        f"{args.call_timeout}s"
+    )
+    print(
+        f"Max pending        : "
+        f"{args.max_pending}"
+    )
+    print("=" * 70)
+    print()
+
+    # -----------------------------------------------------------------------
+    # ESPERAMOS SIGINT / SIGTERM
+    # -----------------------------------------------------------------------
+
+    await stop_event.wait()
+
+    print()
+    print("[MAIN] Señal de apagado recibida")
+
+    # -----------------------------------------------------------------------
+    # SHUTDOWN
+    # -----------------------------------------------------------------------
+
+    await udp_server.stop()
+
+    await manager.stop_all()
+
+    print("[MAIN] Shutdown completo")
 
 
-        # ----------------------------------------------------
-        # main() simplemente mantiene vivo el proceso.
-        #
-        # El trabajo real ocurre en los threads:
-        #
-        # UDP thread
-        # VAD session threads
-        # ----------------------------------------------------
-
-        while running:
-
-            time.sleep(1)
-
-
-    except KeyboardInterrupt:
-
-        pass
-
-
-    finally:
-
-        print(
-            "\n[MANAGER] Stopping..."
-        )
-
-
-        # ----------------------------------------------------
-        # Primero detenemos el UDP.
-        #
-        # Así dejamos de aceptar nuevas llamadas.
-        # ----------------------------------------------------
-
-        udp_server.stop()
-
-
-        # ----------------------------------------------------
-        # Después detenemos todas las sesiones TEN VAD.
-        # ----------------------------------------------------
-
-        manager.stop_all()
-
-
-        print(
-            "[MANAGER] Stopped"
-        )
-
-
-    return 0
-
-
-# ============================================================
+# ===========================================================================
 # ENTRY POINT
-# ============================================================
+# ===========================================================================
 
 if __name__ == "__main__":
 
-    # --------------------------------------------------------
-    # Registramos Ctrl+C y SIGTERM.
-    # --------------------------------------------------------
+    try:
 
-    signal.signal(
-        signal.SIGINT,
-        signal_handler,
-    )
+        asyncio.run(
+            main()
+        )
 
-    signal.signal(
-        signal.SIGTERM,
-        signal_handler,
-    )
+    except KeyboardInterrupt:
 
-
-    # --------------------------------------------------------
-    # Ejecutamos main().
-    # --------------------------------------------------------
-
-    sys.exit(
-        main()
-    )
-
-
+        # Normalmente SIGINT ya es manejado por asyncio,
+        # pero dejamos este fallback.
+        pass
 
 
 ---------
