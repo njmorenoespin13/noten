@@ -1,3 +1,85 @@
-1hf_yuhEuiEJbBOdHzg1ZdnpanCIaAzVMyrsnRI1
-Qwen/Qwen3-Next-80B-A3B-Instruct-FP8
-lihuaaa/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit
+agent.proto
+
+syntax = "proto3";
+
+package business_agent;
+
+
+// ============================================================
+// SERVICIO
+// ============================================================
+
+service BusinessAgentService {
+
+    rpc Chat(ChatRequest) returns (ChatResponse);
+
+    rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+
+// ============================================================
+// INTERACCIÓN
+// ============================================================
+
+message Interaction {
+
+    // Valores permitidos:
+    // "user"
+    // "assistant"
+    string role = 1;
+
+    string content = 2;
+}
+
+
+// ============================================================
+// REQUEST
+// ============================================================
+
+message ChatRequest {
+
+    // Prompt específico del negocio.
+    //
+    // El servidor lo combina con el prompt genérico
+    // de funcionamiento del agente.
+    string custom_system_prompt = 1;
+
+    // Historial COMPLETO de la conversación.
+    //
+    // El servidor no guarda este historial.
+    repeated Interaction interactions = 2;
+}
+
+
+// ============================================================
+// RESPONSE
+// ============================================================
+
+message ChatResponse {
+
+    bool ok = 1;
+
+    // Respuesta final generada por el agente.
+    string response = 2;
+
+    // Error técnico si ok = false.
+    string error = 3;
+}
+
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+message HealthRequest {
+}
+
+
+message HealthResponse {
+
+    bool ok = 1;
+
+    string service = 2;
+
+    bool stateless = 3;
+}
