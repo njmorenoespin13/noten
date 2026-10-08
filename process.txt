@@ -1,6 +1,39 @@
 from num2words import num2words
 import re
 
+def number_to_words_es(value: int) -> str:
+    """
+    Convierte un entero a palabras en español.
+    """
+    return num2words(value, lang="es")
+
+
+def decimal_to_words_es(value: str) -> str:
+    """
+    Convierte un número decimal a palabras.
+    Ejemplo:
+        15.5 -> quince coma cinco
+    """
+    value = value.replace(",", ".")
+
+    try:
+        number = Decimal(value)
+
+        if number == number.to_integral():
+            return number_to_words_es(int(number))
+
+        integer_part = int(number)
+        decimal_part = str(number).split(".")[1]
+
+        return (
+            f"{number_to_words_es(integer_part)} "
+            f"coma "
+            f"{' '.join(number_to_words_es(int(d)) for d in decimal_part)}"
+        )
+
+    except Exception:
+        return value
+
 def final_response_to_words(text: str) -> str:
     """
     Convierte números de la respuesta final a palabras.
