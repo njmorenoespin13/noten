@@ -1,155 +1,277 @@
-async def convert_response_to_words(self, response: str) -> str:
-    """
-    Convierte los números de una respuesta final a palabras en español.
 
-    No ejecuta herramientas ni modifica el resultado de los cálculos.
-    """
+#!/bin/bash
 
-    if not response:
-        return response
+set -u
 
-    conversion_prompt = """
-Eres un conversor de respuestas numéricas a palabras en español.
+# ==========================================
+# CONFIGURACION
+# ==========================================
 
-Tu única tarea es reescribir el texto recibido convirtiendo sus números
-a palabras, conservando exactamente su significado.
+GITEA_URL="http://127.0.0.1:3000"
+REPO_ROOT="/var/lib/gitea/git/repositories"
 
-REGLAS OBLIGATORIAS:
+DEFAULT_PASSWORD="contraseña"
+DEFAULT_EMAIL_DOMAIN="mail.com"
 
-1. Convierte los valores monetarios a palabras completas en español.
-   Ejemplo: $200.000 -> doscientos mil pesos.
-   Ejemplo: $1.250.000 -> un millón doscientos cincuenta mil pesos.
+SUCCESS_USERS=0
+EXISTING_USERS=0
+ERROR_USERS=0
 
-2. Convierte las fechas completas a palabras.
-   Ejemplo: 13 de octubre de 2026 ->
-   trece de octubre de dos mil veintiséis.
+SUCCESS_REPOS=0
+EXISTING_REPOS=0
+ERROR_REPOS=0
 
-3. Convierte cantidades, días, meses, años y porcentajes a palabras.
-   Ejemplo: 15 días -> quince días.
-   Ejemplo: 20% -> veinte por ciento.
+LOG="/var/log/gitea_importacion_$(date +%Y%m%d_%H%M%S).log"
+TMP=$(mktemp)
 
-4. Interpreta los puntos como separadores de miles cuando corresponda
-   al formato monetario colombiano.
+trap 'rm -f "$TMP"' EXIT
 
-5. No conviertas cada dígito individualmente.
-   Debes expresar el número completo correctamente en español.
-   Por ejemplo, 100.000 es "cien mil", no "uno, cero, cero, cero, cero, cero".
+# ==========================================
+# FUNCIONES
+# ==========================================
 
-6. Conserva el significado, el tono, los nombres y toda la información
-   del texto original.
+log() {
+    local MESSAGE="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $MESSAGE" | tee -a "$LOG"
+}
 
-7. No inventes datos, operaciones, cantidades ni fechas.
-   No recalcules ni modifiques ningún resultado.
+urlencode() {
+    jq -rn --arg value "$1" '$value | @uri'
+}
 
-8. No agregues explicaciones, saludos, títulos ni comentarios.
+api_request() {
+    local METHOD="$1"
+    local URL="$2"
+    local DATA="${3:-}"
 
-9. Devuelve exclusivamente el texto final transformado.
+    if [[ -n "$DATA" ]]; then
+        curl -sS \
+            --connect-timeout 10 \
+            --max-time 60 \
+            -o "$TMP" \
+            -w "%{http_code}" \
+            -X "$METHOD" \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$DATA" \
+            "$URL"
+    else
+        curl -sS \
+            --connect-timeout 10 \
+            --max-time 60 \
+            -o "$TMP" \
+            -w "%{http_code}" \
+            -X "$METHOD" \
+            -H "Authorization: token $TOKEN" \
+            "$URL"
+    fi
+}
 
-10. Si aparece un código, teléfono o identificador, consérvalo sin cambios.
+# ==========================================
+# VALIDACIONES
+# ==========================================
 
-TEXTO ORIGINAL:
-"""
+if [[ ! -d "$REPO_ROOT" ]]; then
+    echo "ERROR: No existe la ruta $REPO_ROOT"
+    exit 1
+fi
 
-    try:
-        result = await self.llm.ainvoke(
-            [
-                SystemMessage(content=conversion_prompt),
-                HumanMessage(content=response),
-            ]
-        )
+for CMD in curl jq find; do
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+        echo "ERROR: Falta instalar $CMD"
+        exit 1
+    fi
+done
 
-        content = result.content
+echo
+echo "=========================================="
+echo "       IMPORTADOR MASIVO GITEA"
+echo "=========================================="
+echo "Ruta: $REPO_ROOT"
+echo "Servidor: $GITEA_URL"
+echo
 
-        if isinstance(content, str) and content.strip():
-            return content.strip()
+read -rsp "Token del administrador Gitea: " TOKEN
+echo
+echo
 
-        return response
+# Comprobar autenticacion
+HTTP=$(api_request GET "$GITEA_URL/api/v1/user")
 
-    except Exception:
-        logging.exception(
-            "Error convirtiendo la respuesta final a palabras"
-        )
+if [[ "$HTTP" != "200" ]]; then
+    echo "ERROR: No se pudo autenticar con Gitea. HTTP $HTTP"
+    cat "$TMP"
+    exit 1
+fi
 
-        # Si falla la conversión, conservamos la respuesta original.
-        return response
+log "Conexion con Gitea correcta."
 
+# Contar usuarios y repositorios
+USER_COUNT=0
+REPO_COUNT=0
 
-async def extract_final_response(
-    self,
-    state: AgentState,
-) -> str:
+for OWNER_DIR in "$REPO_ROOT"/*/; do
+    [[ -d "$OWNER_DIR" ]] || continue
 
-    messages = state["messages"]
+    ((USER_COUNT+=1))
 
-    # ----------------------------------------------------
-    # Primero buscamos herramientas terminales.
-    # ----------------------------------------------------
+    while IFS= read -r -d '' REPO_DIR; do
+        ((REPO_COUNT+=1))
+    done < <(find "$OWNER_DIR" -mindepth 1 -maxdepth 1 \
+        -type d -name "*.git" -print0)
+done
 
-    terminal_messages = [
-        message
-        for message in messages
-        if (
-            isinstance(message, ToolMessage)
-            and message.name in TERMINAL_TOOLS
-        )
-    ]
+echo
+echo "Usuarios detectados: $USER_COUNT"
+echo "Repositorios detectados: $REPO_COUNT"
+echo
+read -rp "¿Deseas iniciar la importación? (s/N): " CONFIRM
 
-    if terminal_messages:
+if [[ ! "$CONFIRM" =~ ^[sS]$ ]]; then
+    echo "Proceso cancelado."
+    exit 0
+fi
 
-        responses = []
+# ==========================================
+# PROCESAMIENTO
+# ==========================================
 
-        for message in terminal_messages:
+for OWNER_DIR in "$REPO_ROOT"/*/; do
 
-            formatted = ResponseFormatter.format(
-                message.name,
-                message.content,
-            )
+    [[ -d "$OWNER_DIR" ]] || continue
 
-            responses.append(formatted)
+    OWNER=$(basename "$OWNER_DIR")
+    OWNER_ENC=$(urlencode "$OWNER")
 
-        response = "\n".join(responses)
+    echo
+    log "------------------------------------------"
+    log "PROCESANDO USUARIO: $OWNER"
 
-        # Segunda llamada al modelo:
-        # solamente convierte la respuesta final a palabras.
-        return await self.convert_response_to_words(response)
+    # --------------------------------------
+    # COMPROBAR USUARIO
+    # --------------------------------------
 
-    # ----------------------------------------------------
-    # Si no hubo herramientas, usamos la respuesta del LLM.
-    # ----------------------------------------------------
+    HTTP=$(api_request GET \
+        "$GITEA_URL/api/v1/users/$OWNER_ENC")
 
-    for message in reversed(messages):
+    if [[ "$HTTP" == "200" ]]; then
 
-        if isinstance(message, AIMessage):
+        log "[USUARIO EXISTENTE] $OWNER - No se modifica"
+        ((EXISTING_USERS+=1))
 
-            content = message.content
+    elif [[ "$HTTP" == "404" ]]; then
 
-            if isinstance(content, str):
+        EMAIL="${OWNER}@${DEFAULT_EMAIL_DOMAIN}"
 
-                response = content.strip()
+        USER_DATA=$(jq -n \
+            --arg username "$OWNER" \
+            --arg email "$EMAIL" \
+            --arg password "$DEFAULT_PASSWORD" \
+            '{
+                username: $username,
+                email: $email,
+                password: $password,
+                must_change_password: true
+            }')
 
-                return await self.convert_response_to_words(
-                    response
-                )
+        HTTP=$(api_request POST \
+            "$GITEA_URL/api/v1/admin/users" \
+            "$USER_DATA")
 
-            if isinstance(content, list):
+        if [[ "$HTTP" == "201" ]]; then
 
-                text_parts = []
+            log "[USUARIO CREADO] $OWNER ($EMAIL)"
+            ((SUCCESS_USERS+=1))
 
-                for item in content:
+        else
 
-                    if isinstance(item, dict):
+            log "[ERROR USUARIO] $OWNER - HTTP $HTTP"
+            log "Respuesta: $(cat "$TMP")"
+            ((ERROR_USERS+=1))
+            continue
 
-                        text = item.get("text")
+        fi
 
-                        if text:
-                            text_parts.append(text)
+    else
 
-                if text_parts:
+        log "[ERROR USUARIO] $OWNER - HTTP $HTTP"
+        log "Respuesta: $(cat "$TMP")"
+        ((ERROR_USERS+=1))
+        continue
 
-                    response = "".join(text_parts).strip()
+    fi
 
-                    return await self.convert_response_to_words(
-                        response
-                    )
+    # --------------------------------------
+    # PROCESAR REPOSITORIOS
+    # --------------------------------------
 
-    return ""
+    while IFS= read -r -d '' REPO_DIR; do
+
+        REPO_FOLDER=$(basename "$REPO_DIR")
+        REPO="${REPO_FOLDER%.git}"
+        REPO_ENC=$(urlencode "$REPO")
+
+        log "Repositorio: $OWNER/$REPO"
+
+        # Comprobar si ya existe en Gitea
+        HTTP=$(api_request GET \
+            "$GITEA_URL/api/v1/repos/$OWNER_ENC/$REPO_ENC")
+
+        if [[ "$HTTP" == "200" ]]; then
+
+            log "[REPOSITORIO EXISTENTE] $OWNER/$REPO - Sin cambios"
+            ((EXISTING_REPOS+=1))
+            continue
+
+        elif [[ "$HTTP" != "404" ]]; then
+
+            log "[ERROR CONSULTA] $OWNER/$REPO - HTTP $HTTP"
+            log "Respuesta: $(cat "$TMP")"
+            ((ERROR_REPOS+=1))
+            continue
+
+        fi
+
+        # Adoptar repositorio existente en disco
+        HTTP=$(api_request POST \
+            "$GITEA_URL/api/v1/admin/unadopted/$OWNER_ENC/$REPO_ENC")
+
+        if [[ "$HTTP" =~ ^2[0-9][0-9]$ ]]; then
+
+            log "[REPOSITORIO ADOPTADO] $OWNER/$REPO"
+            ((SUCCESS_REPOS+=1))
+
+        else
+
+            log "[ERROR ADOPCION] $OWNER/$REPO - HTTP $HTTP"
+            log "Respuesta: $(cat "$TMP")"
+            ((ERROR_REPOS+=1))
+
+        fi
+
+    done < <(find "$OWNER_DIR" -mindepth 1 -maxdepth 1 \
+        -type d -name "*.git" -print0)
+
+done
+
+# ==========================================
+# RESUMEN
+# ==========================================
+
+echo
+echo "=========================================="
+echo "             RESUMEN FINAL"
+echo "=========================================="
+
+echo "Usuarios creados:       $SUCCESS_USERS"
+echo "Usuarios existentes:    $EXISTING_USERS"
+echo "Errores de usuarios:    $ERROR_USERS"
+
+echo "Repositorios adoptados: $SUCCESS_REPOS"
+echo "Repositorios existentes:$EXISTING_REPOS"
+echo "Errores de repositorios:$ERROR_REPOS"
+
+echo
+echo "Log: $LOG"
+echo "=========================================="
+
