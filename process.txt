@@ -1,277 +1,192 @@
-
-#!/bin/bash
-
-set -u
-
-# ==========================================
-# CONFIGURACION
-# ==========================================
-
-GITEA_URL="http://127.0.0.1:3000"
-REPO_ROOT="/var/lib/gitea/git/repositories"
-
-DEFAULT_PASSWORD="contraseña"
-DEFAULT_EMAIL_DOMAIN="mail.com"
-
-SUCCESS_USERS=0
-EXISTING_USERS=0
-ERROR_USERS=0
-
-SUCCESS_REPOS=0
-EXISTING_REPOS=0
-ERROR_REPOS=0
-
-LOG="/var/log/gitea_importacion_$(date +%Y%m%d_%H%M%S).log"
-TMP=$(mktemp)
-
-trap 'rm -f "$TMP"' EXIT
-
-# ==========================================
-# FUNCIONES
-# ==========================================
-
-log() {
-    local MESSAGE="$1"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $MESSAGE" | tee -a "$LOG"
-}
-
-urlencode() {
-    jq -rn --arg value "$1" '$value | @uri'
-}
-
-api_request() {
-    local METHOD="$1"
-    local URL="$2"
-    local DATA="${3:-}"
-
-    if [[ -n "$DATA" ]]; then
-        curl -sS \
-            --connect-timeout 10 \
-            --max-time 60 \
-            -o "$TMP" \
-            -w "%{http_code}" \
-            -X "$METHOD" \
-            -H "Authorization: token $TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$DATA" \
-            "$URL"
-    else
-        curl -sS \
-            --connect-timeout 10 \
-            --max-time 60 \
-            -o "$TMP" \
-            -w "%{http_code}" \
-            -X "$METHOD" \
-            -H "Authorization: token $TOKEN" \
-            "$URL"
-    fi
-}
-
-# ==========================================
-# VALIDACIONES
-# ==========================================
-
-if [[ ! -d "$REPO_ROOT" ]]; then
-    echo "ERROR: No existe la ruta $REPO_ROOT"
-    exit 1
-fi
-
-for CMD in curl jq find; do
-    if ! command -v "$CMD" >/dev/null 2>&1; then
-        echo "ERROR: Falta instalar $CMD"
-        exit 1
-    fi
-done
-
-echo
-echo "=========================================="
-echo "       IMPORTADOR MASIVO GITEA"
-echo "=========================================="
-echo "Ruta: $REPO_ROOT"
-echo "Servidor: $GITEA_URL"
-echo
-
-read -rsp "Token del administrador Gitea: " TOKEN
-echo
-echo
-
-# Comprobar autenticacion
-HTTP=$(api_request GET "$GITEA_URL/api/v1/user")
-
-if [[ "$HTTP" != "200" ]]; then
-    echo "ERROR: No se pudo autenticar con Gitea. HTTP $HTTP"
-    cat "$TMP"
-    exit 1
-fi
-
-log "Conexion con Gitea correcta."
-
-# Contar usuarios y repositorios
-USER_COUNT=0
-REPO_COUNT=0
-
-for OWNER_DIR in "$REPO_ROOT"/*/; do
-    [[ -d "$OWNER_DIR" ]] || continue
-
-    ((USER_COUNT+=1))
-
-    while IFS= read -r -d '' REPO_DIR; do
-        ((REPO_COUNT+=1))
-    done < <(find "$OWNER_DIR" -mindepth 1 -maxdepth 1 \
-        -type d -name "*.git" -print0)
-done
-
-echo
-echo "Usuarios detectados: $USER_COUNT"
-echo "Repositorios detectados: $REPO_COUNT"
-echo
-read -rp "¿Deseas iniciar la importación? (s/N): " CONFIRM
-
-if [[ ! "$CONFIRM" =~ ^[sS]$ ]]; then
-    echo "Proceso cancelado."
-    exit 0
-fi
-
-# ==========================================
-# PROCESAMIENTO
-# ==========================================
-
-for OWNER_DIR in "$REPO_ROOT"/*/; do
-
-    [[ -d "$OWNER_DIR" ]] || continue
-
-    OWNER=$(basename "$OWNER_DIR")
-    OWNER_ENC=$(urlencode "$OWNER")
-
-    echo
-    log "------------------------------------------"
-    log "PROCESANDO USUARIO: $OWNER"
-
-    # --------------------------------------
-    # COMPROBAR USUARIO
-    # --------------------------------------
-
-    HTTP=$(api_request GET \
-        "$GITEA_URL/api/v1/users/$OWNER_ENC")
-
-    if [[ "$HTTP" == "200" ]]; then
-
-        log "[USUARIO EXISTENTE] $OWNER - No se modifica"
-        ((EXISTING_USERS+=1))
-
-    elif [[ "$HTTP" == "404" ]]; then
-
-        EMAIL="${OWNER}@${DEFAULT_EMAIL_DOMAIN}"
-
-        USER_DATA=$(jq -n \
-            --arg username "$OWNER" \
-            --arg email "$EMAIL" \
-            --arg password "$DEFAULT_PASSWORD" \
-            '{
-                username: $username,
-                email: $email,
-                password: $password,
-                must_change_password: true
-            }')
-
-        HTTP=$(api_request POST \
-            "$GITEA_URL/api/v1/admin/users" \
-            "$USER_DATA")
-
-        if [[ "$HTTP" == "201" ]]; then
-
-            log "[USUARIO CREADO] $OWNER ($EMAIL)"
-            ((SUCCESS_USERS+=1))
-
-        else
-
-            log "[ERROR USUARIO] $OWNER - HTTP $HTTP"
-            log "Respuesta: $(cat "$TMP")"
-            ((ERROR_USERS+=1))
-            continue
-
-        fi
-
-    else
-
-        log "[ERROR USUARIO] $OWNER - HTTP $HTTP"
-        log "Respuesta: $(cat "$TMP")"
-        ((ERROR_USERS+=1))
-        continue
-
-    fi
-
-    # --------------------------------------
-    # PROCESAR REPOSITORIOS
-    # --------------------------------------
-
-    while IFS= read -r -d '' REPO_DIR; do
-
-        REPO_FOLDER=$(basename "$REPO_DIR")
-        REPO="${REPO_FOLDER%.git}"
-        REPO_ENC=$(urlencode "$REPO")
-
-        log "Repositorio: $OWNER/$REPO"
-
-        # Comprobar si ya existe en Gitea
-        HTTP=$(api_request GET \
-            "$GITEA_URL/api/v1/repos/$OWNER_ENC/$REPO_ENC")
-
-        if [[ "$HTTP" == "200" ]]; then
-
-            log "[REPOSITORIO EXISTENTE] $OWNER/$REPO - Sin cambios"
-            ((EXISTING_REPOS+=1))
-            continue
-
-        elif [[ "$HTTP" != "404" ]]; then
-
-            log "[ERROR CONSULTA] $OWNER/$REPO - HTTP $HTTP"
-            log "Respuesta: $(cat "$TMP")"
-            ((ERROR_REPOS+=1))
-            continue
-
-        fi
-
-        # Adoptar repositorio existente en disco
-        HTTP=$(api_request POST \
-            "$GITEA_URL/api/v1/admin/unadopted/$OWNER_ENC/$REPO_ENC")
-
-        if [[ "$HTTP" =~ ^2[0-9][0-9]$ ]]; then
-
-            log "[REPOSITORIO ADOPTADO] $OWNER/$REPO"
-            ((SUCCESS_REPOS+=1))
-
-        else
-
-            log "[ERROR ADOPCION] $OWNER/$REPO - HTTP $HTTP"
-            log "Respuesta: $(cat "$TMP")"
-            ((ERROR_REPOS+=1))
-
-        fi
-
-    done < <(find "$OWNER_DIR" -mindepth 1 -maxdepth 1 \
-        -type d -name "*.git" -print0)
-
-done
-
-# ==========================================
-# RESUMEN
-# ==========================================
-
-echo
-echo "=========================================="
-echo "             RESUMEN FINAL"
-echo "=========================================="
-
-echo "Usuarios creados:       $SUCCESS_USERS"
-echo "Usuarios existentes:    $EXISTING_USERS"
-echo "Errores de usuarios:    $ERROR_USERS"
-
-echo "Repositorios adoptados: $SUCCESS_REPOS"
-echo "Repositorios existentes:$EXISTING_REPOS"
-echo "Errores de repositorios:$ERROR_REPOS"
-
-echo
-echo "Log: $LOG"
-echo "=========================================="
-
+NGINX2ROOT
+Guía de inventario, detección, mitigación,
+actualización y verificación
+NGINX instalado directamente en un servidor Linux (sin Docker)
+
+Campo	Detalle
+Fecha de elaboración	18 de noviembre de 2026
+Alcance	NGINX Open Source / NGINX Plus instalado en el sistema operativo anfitrión
+Distribución de referencia	Ubuntu/Debian. En RHEL, AlmaLinux, Rocky Linux y otras, seguir el gestor y aviso de seguridad propios.
+Objetivo	Identificar instancias y configuraciones expuestas, aplicar el parche del proveedor y documentar evidencias.
+
+IMPORTANTE: esta guía es defensiva. No incluye pruebas de explotación.
+
+ 1. Resumen ejecutivo
+NGINX2Root es el nombre usado por el equipo investigador Xint para agrupar cinco vulnerabilidades críticas de NGINX y una vulnerabilidad separada del kernel Linux que, según la investigación, podría encadenarse con fallos de NGINX para elevar privilegios hasta root. El nombre NGINX2Root no es el nombre oficial de un producto ni de una única CVE.
+Las vulnerabilidades de NGINX pueden permitir que un atacante remoto no autenticado provoque la caída de procesos worker y, bajo condiciones específicas, ejecute código con los privilegios del worker. La elevación posterior a root depende de la vulnerabilidad independiente del kernel y de las condiciones del sistema; no debe asumirse que cualquier NGINX vulnerable equivale automáticamente a acceso root.
+Prioridad: inventariar primero todos los servidores accesibles desde Internet, comprobar qué funciones están activas y actualizar desde el canal oficial del sistema operativo o del proveedor de NGINX. Deshabilitar HTTP/2 puede reducir temporalmente la exposición a dos CVE, pero no sustituye el parche.
+2. Vulnerabilidades incluidas
+CVE	Área / condición relevante	Qué revisar
+CVE-2026-123007	Módulo HTTP/2; HTTP/2 habilitado en un listener.	Listeners TLS que negocian h2.
+CVE-2026-123633	HTTP/2 en escenarios con conexiones a upstream.	HTTP/2 y directivas como proxy_pass, fastcgi_pass o grpc_pass.
+CVE-2026-123634	Resolver/proxy con combinación específica de variables y subsolicitudes mirror o SSI.	resolver, proxy_pass con variables, mirror, mirror_request_body, SSI.
+CVE-2026-121810	HTTP/3 / QUIC; escenario de proxy upstream.	Listeners quic/http3 y directivas upstream.
+CVE-2026-113425	Módulo de proxy de correo.	Configuración mail y proxy on.
+
+La presencia aislada de una directiva no demuestra explotabilidad. Deben evaluarse versión/build, módulos compilados, contexto de configuración y condiciones exactas descritas por el proveedor.
+3. Versiones: cómo interpretarlas correctamente
+Para NGINX Open Source, los avisos publicados indican como versiones corregidas 1.30.7 (rama estable) y 1.31.9 (rama mainline). En términos generales, la rama estable 1.30.0–1.30.6 y la rama mainline 1.31.0–1.31.8 están afectadas, además de versiones anteriores desde que se introdujeron las funciones afectadas. La aplicabilidad exacta depende de cada CVE.
+NGINX Plus tiene builds corregidos propios. No uses los números de Open Source para decidir si NGINX Plus está parcheado.
+Distribuciones Linux pueden aplicar backports: el paquete puede conservar un número upstream aparentemente antiguo y aun así contener la corrección. Por eso, en Ubuntu/Debian hay que verificar la versión del paquete y el aviso de seguridad de la distribución; no basta con nginx -v.
+4. Plan de trabajo y orden recomendado
+Fase	Actividad	Resultado esperado
+A. Inventario	Localizar NGINX, servicios, puertos, dominios y propietario.	Lista completa de instancias.
+B. Diagnóstico	Identificar versión, paquete, módulos y configuración relevante.	Matriz de exposición por CVE.
+C. Priorización	Priorizar Internet-facing y funciones afectadas activas.	Orden de intervención.
+D. Cambio	Backup, parche oficial, prueba de configuración y reinicio controlado.	Servidor actualizado.
+E. Validación	Comprobar paquete, binario en ejecución, protocolos y servicio.	Evidencia de corrección.
+F. Seguimiento	Revisar logs, procesos, kernel y registrar excepciones.	Cierre documentado.
+
+5. Preparación y precauciones
+•	Ejecuta el diagnóstico con una cuenta autorizada y privilegios sudo cuando sean necesarios.
+•	Programa la actualización en una ventana de mantenimiento si el servidor presta servicios críticos.
+•	Asegura acceso SSH alternativo o consola de recuperación antes de reiniciar servicios.
+•	No pegues ni envíes la salida completa de nginx -T: puede revelar dominios internos, rutas, tokens, cabeceras y otros datos sensibles.
+•	Registra fecha, hostname, responsable, IP/segmento, servicios afectados y resultado de cada comando.
+•	Si el servidor usa Plesk, cPanel, un appliance o paquetes de un tercero, utiliza el procedimiento de ese fabricante; no mezcles paquetes manuales con los del panel.
+6. Detección paso a paso (Ubuntu/Debian)
+6.1 Identificar sistema operativo y servidor
+hostnamectl
+cat /etc/os-release
+uname -r
+systemctl status nginx --no-pager
+Si el servicio no se llama nginx o no aparece, no concluyas que no existe. Puede ejecutarse con otro nombre, desde una instalación compilada manualmente o bajo un panel de hosting.
+6.2 Identificar versión y procedencia del paquete
+nginx -v 2>&1
+nginx -V 2>&1
+dpkg -l | grep -E 'nginx|openresty'
+apt-cache policy nginx
+Guarda la salida. nginx -V permite revisar argumentos de compilación y módulos; dpkg/apt muestran la versión empaquetada y el origen. Si fue compilado manualmente, revisa también la ruta del ejecutable y su método de actualización.
+6.3 Localizar binario y proceso en ejecución
+command -v nginx
+readlink -f "$(command -v nginx)"
+ps -eo user,pid,ppid,lstart,args | grep '[n]ginx'
+systemctl show nginx -p ExecStart -p MainPID
+Esto ayuda a detectar instalaciones múltiples o procesos que continúan usando un binario anterior. El proceso maestro y los workers deben corresponder a la instalación que estás actualizando.
+6.4 Revisar directivas relevantes sin divulgar toda la configuración
+sudo nginx -T 2>&1 | grep -nEi 'listen|http2|http3|quic|resolver|proxy_pass|fastcgi_pass|grpc_pass|mirror|ssi|mail|proxy on'
+Este filtro es orientativo y puede omitir configuraciones construidas mediante includes o variables. La salida puede contener nombres de host internos; trátala como información confidencial.
+CVE	Indicadores a revisar	Interpretación inicial
+123007	http2 on; o listen ... http2; y listener público TLS.	HTTP/2 activo requiere evaluación prioritaria.
+123633	HTTP/2 más proxy_pass / fastcgi_pass / grpc_pass.	Revisar escenario upstream específico.
+123634	resolver; proxy_pass con variables; mirror / SSI y condiciones asociadas.	Requiere validar la combinación exacta.
+121810	http3 on; o listen ... quic; y upstream.	HTTP/3/QUIC activo requiere evaluación.
+113425	Bloques mail { ... } y proxy on;.	Revisar si se usa NGINX como proxy de correo.
+
+6.5 Comprobar HTTP/2 negociado desde un equipo de prueba autorizado
+openssl s_client -connect DOMINIO:443 -servername DOMINIO -alpn h2,http/1.1 </dev/null 2>&1
+Sustituye DOMINIO por un host propio. Si aparece 'ALPN protocol: h2', el extremo TLS probado negocia HTTP/2. Si aparece http/1.1, negocia HTTP/1.1 en esa conexión. La ausencia de h2 no demuestra por sí sola que el servidor esté parcheado: verifica que TLS conectó correctamente y prueba cada listener/dominio relevante.
+6.6 Comprobar exposición de red
+sudo ss -lntup
+Relaciona puertos escuchando (por ejemplo 80/443) con firewall, balanceador, NAT y reglas del proveedor cloud. Que un puerto escuche localmente no significa que sea accesible desde Internet; valida el camino de red con el equipo responsable.
+7. Matriz para mapear servidores
+Completa una fila por cada servidor o instancia NGINX. Si hay varios dominios/listeners con configuraciones diferentes, agrega filas adicionales en el inventario técnico.
+ID	Hostname / activo	SO y versión	Origen NGINX	Versión paquete/build	Internet-facing	Responsable
+SRV-01	________________	________________	APT / fuente / panel	________________	Sí / No	________________
+SRV-02	________________	________________	APT / fuente / panel	________________	Sí / No	________________
+SRV-03	________________	________________	APT / fuente / panel	________________	Sí / No	________________
+SRV-04	________________	________________	APT / fuente / panel	________________	Sí / No	________________
+
+ID	HTTP/2	HTTP/3	Resolver + proxy/mirror/SSI	Mail proxy	Estado inicial	Evidencia / ticket
+SRV-01	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	Expuesto / No determinado / No aplica	________________
+SRV-02	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	________________	________________
+SRV-03	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	________________	________________
+SRV-04	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	________________	________________
+
+8. Cómo actualizar de forma segura
+8.1 Antes del cambio
+sudo nginx -t
+sudo cp -a /etc/nginx "/etc/nginx.backup-$(date +%F-%H%M)"
+sudo apt update
+apt-cache policy nginx
+La copia de /etc/nginx no incluye necesariamente certificados, claves, archivos fuera de esa ruta ni configuraciones de aplicaciones. Asegura el backup conforme al procedimiento de tu organización. Protege especialmente las claves privadas.
+8.2 Verificar que el repositorio ofrece una corrección
+Consulta el aviso de seguridad de Ubuntu/Debian para la versión exacta del sistema y el paquete instalado. Confirma que la versión candidata incluye el parche de los CVE. Si no hay una versión corregida disponible, no fuerces una mezcla de repositorios ni instales un binario aleatorio: aplica la mitigación temporal aprobada y escala al proveedor.
+apt-cache policy nginx
+apt list --upgradable 2>/dev/null | grep -i nginx
+8.3 Aplicar actualización
+sudo apt upgrade
+Revisa la lista de paquetes y confirma el cambio según el proceso de mantenimiento. Si la actualización afecta dependencias o servicios adicionales, revisa el impacto antes de continuar.
+8.4 Validar configuración y reiniciar
+sudo nginx -t
+sudo systemctl restart nginx
+sudo systemctl status nginx --no-pager
+Se recomienda reiniciar el servicio después de actualizar para garantizar que los nuevos procesos carguen el binario corregido. Un reload por sí solo puede dejar procesos antiguos en ejecución, según el escenario. Verifica el proceso maestro y sus workers después del reinicio.
+8.5 Confirmar versión y binario activo
+nginx -v 2>&1
+ps -eo user,pid,ppid,lstart,args | grep '[n]ginx'
+systemctl show nginx -p MainPID -p ExecStart
+Registra la versión del paquete y la evidencia del aviso de distribución que confirma el backport. En sistemas con paquetes de terceros, confirma el parche con ese proveedor.
+9. Mitigación temporal si no puedes parchear inmediatamente
+La mitigación temporal más citada para los dos fallos HTTP/2 consiste en deshabilitar HTTP/2 en los listeners afectados. Esto puede reducir la exposición a CVE-2026-123007 y CVE-2026-123633, pero NO corrige CVE-2026-123634, CVE-2026-121810, CVE-2026-113425 ni la vulnerabilidad separada del kernel.
+Antes de cambiarlo, revisa cómo está configurado HTTP/2 en tu versión de NGINX. En configuraciones antiguas puede aparecer como parámetro en listen; en otras versiones se usa la directiva http2. Modifica el archivo de origen correcto, no solo un archivo generado por un panel. Prueba y programa el cambio:
+sudo nginx -t
+sudo systemctl restart nginx
+Después comprueba la negociación ALPN con openssl s_client. Conserva HTTP/1.1 si la aplicación lo admite. Esta medida es temporal: restaura HTTP/2 únicamente después de confirmar que el parche está instalado.
+Si se usa HTTP/3, mail proxy o la combinación específica de resolver/proxy/mirror/SSI, se necesita revisar y mitigar cada función de acuerdo con el aviso del proveedor. No elimines directivas a ciegas: puedes interrumpir aplicaciones.
+10. Revisión posterior y señales de posible incidente
+Una configuración vulnerable no demuestra que haya ocurrido una intrusión. Los siguientes controles ayudan a detectar anomalías, pero no son prueba concluyente ni sustituyen un análisis forense.
+sudo journalctl -u nginx --since '24 hours ago' --no-pager
+sudo grep -iE 'worker process|signal 11|segmentation fault|exited on signal' /var/log/nginx/error.log 2>/dev/null
+ps -eo user,pid,ppid,lstart,args --forest
+sudo ss -tunap
+•	Investiga reinicios o caídas inesperadas de workers, especialmente si coinciden con tráfico anómalo.
+•	Revisa procesos hijos inesperados, conexiones salientes no habituales y cambios recientes en cuentas, claves SSH, tareas programadas y archivos de configuración.
+•	Centraliza logs y conserva evidencias antes de borrar archivos o reiniciar repetidamente.
+•	Si existe indicio razonable de compromiso, activa respuesta a incidentes: aísla el servidor de forma controlada, preserva evidencias, rota secretos desde un entorno limpio y evalúa reconstruir desde una imagen confiable.
+11. Kernel Linux: punto separado
+La investigación NGINX2Root describe además una vulnerabilidad local del kernel Linux relacionada con SCTP que podría encadenarse para elevar privilegios. Es independiente de los cinco CVE de NGINX. No se debe asumir que actualizar NGINX la corrige.
+Registra la versión del kernel (uname -r), consulta el aviso de seguridad de tu distribución y aplica las actualizaciones de kernel aprobadas. Si el proveedor aún no publica una corrección, sigue su guía oficial de mitigación; no desactives protocolos o módulos del kernel sin evaluar dependencias.
+12. Checklist operativo de auditoría y cierre
+Fase	Control	Hecho	Fecha / evidencia
+Inventario	Se identificaron todos los servidores con NGINX, incluidas instalaciones manuales y paneles.	☐	__________
+Inventario	Se registró hostname, SO, propietario, exposición de red y origen del paquete.	☐	__________
+Diagnóstico	Se registraron nginx -v, nginx -V, versión del paquete y repositorio.	☐	__________
+Diagnóstico	Se revisaron HTTP/2, HTTP/3/QUIC, resolver, proxy/mirror/SSI y mail proxy.	☐	__________
+Diagnóstico	Se comprobó negociación ALPN en cada dominio/listener TLS aplicable.	☐	__________
+Priorización	Se priorizaron sistemas expuestos a Internet y funciones vulnerables activas.	☐	__________
+Preparación	Existe backup de configuración y plan de reversa probado/revisado.	☐	__________
+Corrección	Se confirmó en el aviso del proveedor que el paquete instalado contiene los parches.	☐	__________
+Corrección	Se actualizó NGINX desde el repositorio/proveedor autorizado.	☐	__________
+Corrección	nginx -t finalizó correctamente y se reinició el servicio.	☐	__________
+Verificación	Se comprobó que los procesos usan el binario actualizado.	☐	__________
+Verificación	Se verificaron HTTP/2/HTTP/3 según la política posterior al parche.	☐	__________
+Verificación	Se revisaron logs, procesos y conexiones anómalas.	☐	__________
+Kernel	Se verificó el estado de actualizaciones de seguridad del kernel.	☐	__________
+Cierre	Se adjuntaron evidencias, fecha, responsable, ticket y excepciones.	☐	__________
+
+13. Criterios de resultado
+Estado	Criterio
+Corregido	El proveedor confirma el parche en el paquete/build instalado; NGINX se reinició; configuración y servicio validados.
+Mitigado temporalmente	Se deshabilitó una función afectada para reducir riesgo, pero falta instalar el parche completo.
+Expuesto	Versión/build sin corrección y condición vulnerable activa o no descartada.
+Pendiente de validar	Faltan datos de paquete, configuración, proveedor o exposición de red.
+No aplica	La instancia no usa el componente/función afectada y la evaluación documentada descarta esa ruta; mantener inventario.
+
+14. Plantilla de registro por servidor
+Dato	Completar
+ID / hostname	____________________________________________
+IP / segmento / dominio	____________________________________________
+Sistema operativo y release	____________________________________________
+Kernel (uname -r)	____________________________________________
+Origen de NGINX	APT / repositorio NGINX / compilación / panel / otro
+Versión upstream y versión de paquete	____________________________________________
+HTTP/2 / HTTP/3 / mail proxy	____________________________________________
+Directivas relevantes encontradas	____________________________________________
+Exposición a Internet	Sí / No / A través de balanceador
+Aviso del proveedor y parche confirmado	____________________________________________
+Cambio ejecutado / ticket	____________________________________________
+Fecha de reinicio y validación	____________________________________________
+Resultado final / excepciones	____________________________________________
+Responsable y aprobador	____________________________________________
+
+15. Fuentes y lecturas oficiales
+•	Xint – página del proyecto NGINX2Root: https://nginx2root.com/
+•	Xint – análisis y recomendaciones: https://xint.io/blog/nginx2root-remote-code-execution
+•	Sophos – advisory NGINX2Root (18 nov 2026): https://www.sophos.com/en-us/security-advisories/sophos-sa-20261118-nginx2root
+•	Tenable – FAQ sobre las cinco vulnerabilidades: https://es-la.tenable.com/blog/nginx2root-cve-2026-123007-frequently-asked-questions-about-five-critical-nginx
+•	NGINX – Security Advisories: https://nginx.org/en/security_advisories.html
+•	F5 – Security advisory: https://my.f5.com/manage/s/article/K000164058
+•	CERT-EU – Security Advisory 2026-022: https://cert.europa.eu/publications/security-advisories/2026-022/pdf
+•	Plesk – NGINX2Root para instalaciones Plesk: https://support.plesk.com/hc/en-us/articles/45139407796119-Vulnerability-CVE-2026-123007-CVE-2026-123633-CVE-2026-123634-CVE-2026-121810-and-CVE-2026-113425-NGINX2Root-Remote-code-execution-in-NGINX-shipped-with-Plesk-for-Linux
+Nota de vigencia: este documento refleja la información pública consultada el 18/11/2026. Los avisos, paquetes corregidos y mitigaciones pueden cambiar. Antes de cada intervención, confirma el aviso más reciente del fabricante de NGINX y del sistema operativo.
