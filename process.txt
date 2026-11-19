@@ -1,192 +1,77 @@
-NGINX2ROOT
-Guía de inventario, detección, mitigación,
-actualización y verificación
-NGINX instalado directamente en un servidor Linux (sin Docker)
+<div style="width:700px;height:350px;max-width:100%;box-sizing:border-box;padding:14px;display:grid;grid-template-columns:2fr 3fr;gap:16px;background:#FFFFFF;border:1px solid #E2E6F0;border-radius:18px;box-shadow:0 12px 32px rgba(27,37,89,0.16);font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1B2559;">
 
-Campo	Detalle
-Fecha de elaboración	18 de noviembre de 2026
-Alcance	NGINX Open Source / NGINX Plus instalado en el sistema operativo anfitrión
-Distribución de referencia	Ubuntu/Debian. En RHEL, AlmaLinux, Rocky Linux y otras, seguir el gestor y aviso de seguridad propios.
-Objetivo	Identificar instancias y configuraciones expuestas, aplicar el parche del proveedor y documentar evidencias.
+  <!-- SECCIÓN 1: RECOMENDACIÓN -->
+  <div style="position:relative;overflow:hidden;box-sizing:border-box;min-height:0;display:flex;flex-direction:column;gap:12px;padding:16px;background:linear-gradient(145deg,#1B2559 0%,#343C8C 100%);border-radius:14px;color:#FFFFFF;">
+    <div style="position:absolute;top:-40px;right:-40px;width:130px;height:130px;border-radius:50%;background:rgba(157,194,24,0.22);"></div>
+    <div style="position:absolute;bottom:-50px;left:-30px;width:110px;height:110px;border-radius:50%;background:rgba(255,255,255,0.06);"></div>
 
-IMPORTANTE: esta guía es defensiva. No incluye pruebas de explotación.
+    <div style="position:relative;display:flex;align-items:center;gap:10px;">
+      <span style="width:28px;height:28px;border-radius:9px;background:#9DC218;color:#1B2559;display:flex;align-items:center;justify-content:center;font-size:15px;line-height:1;">★</span>
+      <h3 style="margin:0;font-size:16px;font-weight:700;letter-spacing:0.2px;color:#FFFFFF;">Recomendación</h3>
+    </div>
 
- 1. Resumen ejecutivo
-NGINX2Root es el nombre usado por el equipo investigador Xint para agrupar cinco vulnerabilidades críticas de NGINX y una vulnerabilidad separada del kernel Linux que, según la investigación, podría encadenarse con fallos de NGINX para elevar privilegios hasta root. El nombre NGINX2Root no es el nombre oficial de un producto ni de una única CVE.
-Las vulnerabilidades de NGINX pueden permitir que un atacante remoto no autenticado provoque la caída de procesos worker y, bajo condiciones específicas, ejecute código con los privilegios del worker. La elevación posterior a root depende de la vulnerabilidad independiente del kernel y de las condiciones del sistema; no debe asumirse que cualquier NGINX vulnerable equivale automáticamente a acceso root.
-Prioridad: inventariar primero todos los servidores accesibles desde Internet, comprobar qué funciones están activas y actualizar desde el canal oficial del sistema operativo o del proveedor de NGINX. Deshabilitar HTTP/2 puede reducir temporalmente la exposición a dos CVE, pero no sustituye el parche.
-2. Vulnerabilidades incluidas
-CVE	Área / condición relevante	Qué revisar
-CVE-2026-123007	Módulo HTTP/2; HTTP/2 habilitado en un listener.	Listeners TLS que negocian h2.
-CVE-2026-123633	HTTP/2 en escenarios con conexiones a upstream.	HTTP/2 y directivas como proxy_pass, fastcgi_pass o grpc_pass.
-CVE-2026-123634	Resolver/proxy con combinación específica de variables y subsolicitudes mirror o SSI.	resolver, proxy_pass con variables, mirror, mirror_request_body, SSI.
-CVE-2026-121810	HTTP/3 / QUIC; escenario de proxy upstream.	Listeners quic/http3 y directivas upstream.
-CVE-2026-113425	Módulo de proxy de correo.	Configuración mail y proxy on.
+    <!-- Aquí va el texto de la recomendación -->
+    <p style="position:relative;margin:0;flex:1;min-height:0;overflow-y:auto;font-size:14.5px;line-height:1.6;color:#E8EAF8;">El cliente llamó dos veces este mes por el mismo cobro. Reconoce el inconveniente desde el inicio, confirma que ya está en revisión y ofrece una fecha concreta de respuesta.</p>
 
-La presencia aislada de una directiva no demuestra explotabilidad. Deben evaluarse versión/build, módulos compilados, contexto de configuración y condiciones exactas descritas por el proveedor.
-3. Versiones: cómo interpretarlas correctamente
-Para NGINX Open Source, los avisos publicados indican como versiones corregidas 1.30.7 (rama estable) y 1.31.9 (rama mainline). En términos generales, la rama estable 1.30.0–1.30.6 y la rama mainline 1.31.0–1.31.8 están afectadas, además de versiones anteriores desde que se introdujeron las funciones afectadas. La aplicabilidad exacta depende de cada CVE.
-NGINX Plus tiene builds corregidos propios. No uses los números de Open Source para decidir si NGINX Plus está parcheado.
-Distribuciones Linux pueden aplicar backports: el paquete puede conservar un número upstream aparentemente antiguo y aun así contener la corrección. Por eso, en Ubuntu/Debian hay que verificar la versión del paquete y el aviso de seguridad de la distribución; no basta con nginx -v.
-4. Plan de trabajo y orden recomendado
-Fase	Actividad	Resultado esperado
-A. Inventario	Localizar NGINX, servicios, puertos, dominios y propietario.	Lista completa de instancias.
-B. Diagnóstico	Identificar versión, paquete, módulos y configuración relevante.	Matriz de exposición por CVE.
-C. Priorización	Priorizar Internet-facing y funciones afectadas activas.	Orden de intervención.
-D. Cambio	Backup, parche oficial, prueba de configuración y reinicio controlado.	Servidor actualizado.
-E. Validación	Comprobar paquete, binario en ejecución, protocolos y servicio.	Evidencia de corrección.
-F. Seguimiento	Revisar logs, procesos, kernel y registrar excepciones.	Cierre documentado.
+    <!-- Alerta opcional: borra este bloque si no la necesitas -->
+    <div style="position:relative;display:flex;align-items:center;gap:8px;padding:7px 10px;background:rgba(255,255,255,0.14);border-radius:10px;font-size:12px;line-height:1.3;color:#FFFFFF;">
+      <span style="width:8px;height:8px;flex:none;border-radius:50%;background:#FBBF24;"></span>
+      <span>Cliente con reclamo abierto</span>
+    </div>
+  </div>
 
-5. Preparación y precauciones
-•	Ejecuta el diagnóstico con una cuenta autorizada y privilegios sudo cuando sean necesarios.
-•	Programa la actualización en una ventana de mantenimiento si el servidor presta servicios críticos.
-•	Asegura acceso SSH alternativo o consola de recuperación antes de reiniciar servicios.
-•	No pegues ni envíes la salida completa de nginx -T: puede revelar dominios internos, rutas, tokens, cabeceras y otros datos sensibles.
-•	Registra fecha, hostname, responsable, IP/segmento, servicios afectados y resultado de cada comando.
-•	Si el servidor usa Plesk, cPanel, un appliance o paquetes de un tercero, utiliza el procedimiento de ese fabricante; no mezcles paquetes manuales con los del panel.
-6. Detección paso a paso (Ubuntu/Debian)
-6.1 Identificar sistema operativo y servidor
-hostnamectl
-cat /etc/os-release
-uname -r
-systemctl status nginx --no-pager
-Si el servicio no se llama nginx o no aparece, no concluyas que no existe. Puede ejecutarse con otro nombre, desde una instalación compilada manualmente o bajo un panel de hosting.
-6.2 Identificar versión y procedencia del paquete
-nginx -v 2>&1
-nginx -V 2>&1
-dpkg -l | grep -E 'nginx|openresty'
-apt-cache policy nginx
-Guarda la salida. nginx -V permite revisar argumentos de compilación y módulos; dpkg/apt muestran la versión empaquetada y el origen. Si fue compilado manualmente, revisa también la ruta del ejecutable y su método de actualización.
-6.3 Localizar binario y proceso en ejecución
-command -v nginx
-readlink -f "$(command -v nginx)"
-ps -eo user,pid,ppid,lstart,args | grep '[n]ginx'
-systemctl show nginx -p ExecStart -p MainPID
-Esto ayuda a detectar instalaciones múltiples o procesos que continúan usando un binario anterior. El proceso maestro y los workers deben corresponder a la instalación que estás actualizando.
-6.4 Revisar directivas relevantes sin divulgar toda la configuración
-sudo nginx -T 2>&1 | grep -nEi 'listen|http2|http3|quic|resolver|proxy_pass|fastcgi_pass|grpc_pass|mirror|ssi|mail|proxy on'
-Este filtro es orientativo y puede omitir configuraciones construidas mediante includes o variables. La salida puede contener nombres de host internos; trátala como información confidencial.
-CVE	Indicadores a revisar	Interpretación inicial
-123007	http2 on; o listen ... http2; y listener público TLS.	HTTP/2 activo requiere evaluación prioritaria.
-123633	HTTP/2 más proxy_pass / fastcgi_pass / grpc_pass.	Revisar escenario upstream específico.
-123634	resolver; proxy_pass con variables; mirror / SSI y condiciones asociadas.	Requiere validar la combinación exacta.
-121810	http3 on; o listen ... quic; y upstream.	HTTP/3/QUIC activo requiere evaluación.
-113425	Bloques mail { ... } y proxy on;.	Revisar si se usa NGINX como proxy de correo.
+  <!-- SECCIÓN 2: CHECKLIST + PROGRESO -->
+  <div style="box-sizing:border-box;min-height:0;display:flex;flex-direction:column;padding:2px 0;">
+    <h3 style="margin:0 0 10px;font-size:16px;font-weight:700;color:#1B2559;">Checklist de la llamada</h3>
 
-6.5 Comprobar HTTP/2 negociado desde un equipo de prueba autorizado
-openssl s_client -connect DOMINIO:443 -servername DOMINIO -alpn h2,http/1.1 </dev/null 2>&1
-Sustituye DOMINIO por un host propio. Si aparece 'ALPN protocol: h2', el extremo TLS probado negocia HTTP/2. Si aparece http/1.1, negocia HTTP/1.1 en esa conexión. La ausencia de h2 no demuestra por sí sola que el servidor esté parcheado: verifica que TLS conectó correctamente y prueba cada listener/dominio relevante.
-6.6 Comprobar exposición de red
-sudo ss -lntup
-Relaciona puertos escuchando (por ejemplo 80/443) con firewall, balanceador, NAT y reglas del proveedor cloud. Que un puerto escuche localmente no significa que sea accesible desde Internet; valida el camino de red con el equipo responsable.
-7. Matriz para mapear servidores
-Completa una fila por cada servidor o instancia NGINX. Si hay varios dominios/listeners con configuraciones diferentes, agrega filas adicionales en el inventario técnico.
-ID	Hostname / activo	SO y versión	Origen NGINX	Versión paquete/build	Internet-facing	Responsable
-SRV-01	________________	________________	APT / fuente / panel	________________	Sí / No	________________
-SRV-02	________________	________________	APT / fuente / panel	________________	Sí / No	________________
-SRV-03	________________	________________	APT / fuente / panel	________________	Sí / No	________________
-SRV-04	________________	________________	APT / fuente / panel	________________	Sí / No	________________
+    <div style="display:flex;flex-direction:column;gap:4px;font-size:13.5px;">
 
-ID	HTTP/2	HTTP/3	Resolver + proxy/mirror/SSI	Mail proxy	Estado inicial	Evidencia / ticket
-SRV-01	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	Expuesto / No determinado / No aplica	________________
-SRV-02	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	________________	________________
-SRV-03	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	________________	________________
-SRV-04	Sí / No / ND	Sí / No / ND	Sí / No / Revisar	Sí / No	________________	________________
+      <!-- Completado -->
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;background:#F6F7FB;color:#1E2540;">
+        <span style="width:18px;height:18px;flex:none;border-radius:50%;background:#9DC218;color:#1B2559;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;">✓</span>
+        <span style="line-height:18px;">Saludo y presentación</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;background:#F6F7FB;color:#1E2540;">
+        <span style="width:18px;height:18px;flex:none;border-radius:50%;background:#9DC218;color:#1B2559;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;">✓</span>
+        <span style="line-height:18px;">Validó identidad</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;background:#F6F7FB;color:#1E2540;">
+        <span style="width:18px;height:18px;flex:none;border-radius:50%;background:#9DC218;color:#1B2559;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;">✓</span>
+        <span style="line-height:18px;">Explicó el motivo</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;background:#F6F7FB;color:#1E2540;">
+        <span style="width:18px;height:18px;flex:none;border-radius:50%;background:#9DC218;color:#1B2559;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;">✓</span>
+        <span style="line-height:18px;">Ofreció solución</span>
+      </div>
 
-8. Cómo actualizar de forma segura
-8.1 Antes del cambio
-sudo nginx -t
-sudo cp -a /etc/nginx "/etc/nginx.backup-$(date +%F-%H%M)"
-sudo apt update
-apt-cache policy nginx
-La copia de /etc/nginx no incluye necesariamente certificados, claves, archivos fuera de esa ruta ni configuraciones de aplicaciones. Asegura el backup conforme al procedimiento de tu organización. Protege especialmente las claves privadas.
-8.2 Verificar que el repositorio ofrece una corrección
-Consulta el aviso de seguridad de Ubuntu/Debian para la versión exacta del sistema y el paquete instalado. Confirma que la versión candidata incluye el parche de los CVE. Si no hay una versión corregida disponible, no fuerces una mezcla de repositorios ni instales un binario aleatorio: aplica la mitigación temporal aprobada y escala al proveedor.
-apt-cache policy nginx
-apt list --upgradable 2>/dev/null | grep -i nginx
-8.3 Aplicar actualización
-sudo apt upgrade
-Revisa la lista de paquetes y confirma el cambio según el proceso de mantenimiento. Si la actualización afecta dependencias o servicios adicionales, revisa el impacto antes de continuar.
-8.4 Validar configuración y reiniciar
-sudo nginx -t
-sudo systemctl restart nginx
-sudo systemctl status nginx --no-pager
-Se recomienda reiniciar el servicio después de actualizar para garantizar que los nuevos procesos carguen el binario corregido. Un reload por sí solo puede dejar procesos antiguos en ejecución, según el escenario. Verifica el proceso maestro y sus workers después del reinicio.
-8.5 Confirmar versión y binario activo
-nginx -v 2>&1
-ps -eo user,pid,ppid,lstart,args | grep '[n]ginx'
-systemctl show nginx -p MainPID -p ExecStart
-Registra la versión del paquete y la evidencia del aviso de distribución que confirma el backport. En sistemas con paquetes de terceros, confirma el parche con ese proveedor.
-9. Mitigación temporal si no puedes parchear inmediatamente
-La mitigación temporal más citada para los dos fallos HTTP/2 consiste en deshabilitar HTTP/2 en los listeners afectados. Esto puede reducir la exposición a CVE-2026-123007 y CVE-2026-123633, pero NO corrige CVE-2026-123634, CVE-2026-121810, CVE-2026-113425 ni la vulnerabilidad separada del kernel.
-Antes de cambiarlo, revisa cómo está configurado HTTP/2 en tu versión de NGINX. En configuraciones antiguas puede aparecer como parámetro en listen; en otras versiones se usa la directiva http2. Modifica el archivo de origen correcto, no solo un archivo generado por un panel. Prueba y programa el cambio:
-sudo nginx -t
-sudo systemctl restart nginx
-Después comprueba la negociación ALPN con openssl s_client. Conserva HTTP/1.1 si la aplicación lo admite. Esta medida es temporal: restaura HTTP/2 únicamente después de confirmar que el parche está instalado.
-Si se usa HTTP/3, mail proxy o la combinación específica de resolver/proxy/mirror/SSI, se necesita revisar y mitigar cada función de acuerdo con el aviso del proveedor. No elimines directivas a ciegas: puedes interrumpir aplicaciones.
-10. Revisión posterior y señales de posible incidente
-Una configuración vulnerable no demuestra que haya ocurrido una intrusión. Los siguientes controles ayudan a detectar anomalías, pero no son prueba concluyente ni sustituyen un análisis forense.
-sudo journalctl -u nginx --since '24 hours ago' --no-pager
-sudo grep -iE 'worker process|signal 11|segmentation fault|exited on signal' /var/log/nginx/error.log 2>/dev/null
-ps -eo user,pid,ppid,lstart,args --forest
-sudo ss -tunap
-•	Investiga reinicios o caídas inesperadas de workers, especialmente si coinciden con tráfico anómalo.
-•	Revisa procesos hijos inesperados, conexiones salientes no habituales y cambios recientes en cuentas, claves SSH, tareas programadas y archivos de configuración.
-•	Centraliza logs y conserva evidencias antes de borrar archivos o reiniciar repetidamente.
-•	Si existe indicio razonable de compromiso, activa respuesta a incidentes: aísla el servidor de forma controlada, preserva evidencias, rota secretos desde un entorno limpio y evalúa reconstruir desde una imagen confiable.
-11. Kernel Linux: punto separado
-La investigación NGINX2Root describe además una vulnerabilidad local del kernel Linux relacionada con SCTP que podría encadenarse para elevar privilegios. Es independiente de los cinco CVE de NGINX. No se debe asumir que actualizar NGINX la corrige.
-Registra la versión del kernel (uname -r), consulta el aviso de seguridad de tu distribución y aplica las actualizaciones de kernel aprobadas. Si el proveedor aún no publica una corrección, sigue su guía oficial de mitigación; no desactives protocolos o módulos del kernel sin evaluar dependencias.
-12. Checklist operativo de auditoría y cierre
-Fase	Control	Hecho	Fecha / evidencia
-Inventario	Se identificaron todos los servidores con NGINX, incluidas instalaciones manuales y paneles.	☐	__________
-Inventario	Se registró hostname, SO, propietario, exposición de red y origen del paquete.	☐	__________
-Diagnóstico	Se registraron nginx -v, nginx -V, versión del paquete y repositorio.	☐	__________
-Diagnóstico	Se revisaron HTTP/2, HTTP/3/QUIC, resolver, proxy/mirror/SSI y mail proxy.	☐	__________
-Diagnóstico	Se comprobó negociación ALPN en cada dominio/listener TLS aplicable.	☐	__________
-Priorización	Se priorizaron sistemas expuestos a Internet y funciones vulnerables activas.	☐	__________
-Preparación	Existe backup de configuración y plan de reversa probado/revisado.	☐	__________
-Corrección	Se confirmó en el aviso del proveedor que el paquete instalado contiene los parches.	☐	__________
-Corrección	Se actualizó NGINX desde el repositorio/proveedor autorizado.	☐	__________
-Corrección	nginx -t finalizó correctamente y se reinició el servicio.	☐	__________
-Verificación	Se comprobó que los procesos usan el binario actualizado.	☐	__________
-Verificación	Se verificaron HTTP/2/HTTP/3 según la política posterior al parche.	☐	__________
-Verificación	Se revisaron logs, procesos y conexiones anómalas.	☐	__________
-Kernel	Se verificó el estado de actualizaciones de seguridad del kernel.	☐	__________
-Cierre	Se adjuntaron evidencias, fecha, responsable, ticket y excepciones.	☐	__________
+      <!-- Actual (resaltado) -->
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;background:#F4F9E3;border:1px solid #C9DD83;color:#1B2559;">
+        <span style="width:18px;height:18px;flex:none;box-sizing:border-box;border-radius:50%;border:2px solid #9DC218;box-shadow:0 0 0 3px rgba(157,194,24,0.25);"></span>
+        <span style="line-height:18px;font-weight:600;">Manejo de objeciones</span>
+        <span style="margin-left:auto;padding:2px 9px;border-radius:999px;background:#9DC218;color:#1B2559;font-size:11px;font-weight:700;line-height:16px;">Ahora</span>
+      </div>
 
-13. Criterios de resultado
-Estado	Criterio
-Corregido	El proveedor confirma el parche en el paquete/build instalado; NGINX se reinició; configuración y servicio validados.
-Mitigado temporalmente	Se deshabilitó una función afectada para reducir riesgo, pero falta instalar el parche completo.
-Expuesto	Versión/build sin corrección y condición vulnerable activa o no descartada.
-Pendiente de validar	Faltan datos de paquete, configuración, proveedor o exposición de red.
-No aplica	La instancia no usa el componente/función afectada y la evaluación documentada descarta esa ruta; mantener inventario.
+      <!-- Pendientes -->
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;color:#667085;">
+        <span style="width:18px;height:18px;flex:none;box-sizing:border-box;border-radius:50%;border:2px solid #CDD2E0;"></span>
+        <span style="line-height:18px;">Confirmó el acuerdo</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-radius:10px;color:#667085;">
+        <span style="width:18px;height:18px;flex:none;box-sizing:border-box;border-radius:50%;border:2px solid #CDD2E0;"></span>
+        <span style="line-height:18px;">Cierre y despedida</span>
+      </div>
+    </div>
 
-14. Plantilla de registro por servidor
-Dato	Completar
-ID / hostname	____________________________________________
-IP / segmento / dominio	____________________________________________
-Sistema operativo y release	____________________________________________
-Kernel (uname -r)	____________________________________________
-Origen de NGINX	APT / repositorio NGINX / compilación / panel / otro
-Versión upstream y versión de paquete	____________________________________________
-HTTP/2 / HTTP/3 / mail proxy	____________________________________________
-Directivas relevantes encontradas	____________________________________________
-Exposición a Internet	Sí / No / A través de balanceador
-Aviso del proveedor y parche confirmado	____________________________________________
-Cambio ejecutado / ticket	____________________________________________
-Fecha de reinicio y validación	____________________________________________
-Resultado final / excepciones	____________________________________________
-Responsable y aprobador	____________________________________________
+    <!-- Barra de progreso (cambia el 57% en ambos lugares) -->
+    <div style="margin-top:auto;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+        <span style="font-size:12px;color:#667085;">Progreso · 4 de 7 puntos</span>
+        <span style="font-size:20px;font-weight:700;color:#5E7A0B;line-height:1;">57%</span>
+      </div>
+      <div style="height:10px;border-radius:999px;background:#E5E9F2;overflow:hidden;">
+        <div style="width:57%;height:100%;border-radius:999px;background:linear-gradient(90deg,#9DC218,#B9DC3E);"></div>
+      </div>
+    </div>
+  </div>
 
-15. Fuentes y lecturas oficiales
-•	Xint – página del proyecto NGINX2Root: https://nginx2root.com/
-•	Xint – análisis y recomendaciones: https://xint.io/blog/nginx2root-remote-code-execution
-•	Sophos – advisory NGINX2Root (18 nov 2026): https://www.sophos.com/en-us/security-advisories/sophos-sa-20261118-nginx2root
-•	Tenable – FAQ sobre las cinco vulnerabilidades: https://es-la.tenable.com/blog/nginx2root-cve-2026-123007-frequently-asked-questions-about-five-critical-nginx
-•	NGINX – Security Advisories: https://nginx.org/en/security_advisories.html
-•	F5 – Security advisory: https://my.f5.com/manage/s/article/K000164058
-•	CERT-EU – Security Advisory 2026-022: https://cert.europa.eu/publications/security-advisories/2026-022/pdf
-•	Plesk – NGINX2Root para instalaciones Plesk: https://support.plesk.com/hc/en-us/articles/45139407796119-Vulnerability-CVE-2026-123007-CVE-2026-123633-CVE-2026-123634-CVE-2026-121810-and-CVE-2026-113425-NGINX2Root-Remote-code-execution-in-NGINX-shipped-with-Plesk-for-Linux
-Nota de vigencia: este documento refleja la información pública consultada el 18/11/2026. Los avisos, paquetes corregidos y mitigaciones pueden cambiar. Antes de cada intervención, confirma el aviso más reciente del fabricante de NGINX y del sistema operativo.
+</div>
